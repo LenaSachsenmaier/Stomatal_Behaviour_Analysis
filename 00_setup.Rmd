@@ -42,12 +42,12 @@ Primary data are currently restricted during peer review. Will be made publicly 
 
 data <- here(
   "data", "raw",
-  "DATA_01_stomatal_conductance.csv"
+  "01_data_stomatal_conductance.csv"
 )
 
 climate_data <- here(
   "data", "raw",
-  "DATA_02_climate_station_data_ARBOfun_2024.csv"
+  "02_data_climate_station_ARBOfun.csv"
 )
 
 if (!file.exists(data)) {
