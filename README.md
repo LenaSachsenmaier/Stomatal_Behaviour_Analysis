@@ -1,4 +1,4 @@
-# Stomatal behaviour across tree species predicts physiological drought stress but weakly reflects leaf traits
+# Stomatal behaviour across 38 tree species predicts physiological drought stress but weakly reflects leaf traits
 
 ## Project Description
 
