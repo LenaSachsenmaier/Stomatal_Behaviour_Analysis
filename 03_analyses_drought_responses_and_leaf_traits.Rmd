@@ -1,0 +1,2213 @@
+---
+title: "Stomatal Behaviour - 03 Trait Analysis"
+author: "Lena Sachsenmaier"
+output:
+  html_document:
+    df_print: paged
+contact: lena.sachsenmaier@idiv.de
+update: "2026-07-30"
+---
+
+**updated by**: Lena Sachsenmaier
+**Contact**: lena.sachsenmaier@idiv.de  
+**Last updated**: `r format(Sys.time(), '%d %B, %Y')`
+
+# Analysis of stomatal behaviour metrics and their relationships with
+# leaf traits and drought response responses
+
+```{r setup, include=FALSE}
+
+library(tidyverse) # basic data handling
+library(here) # reproducible file pathes
+
+# data viualization and figure arrangement
+library(ggExtra)
+library(ggpubr)
+library(patchwork)
+library(ggeffects)
+library(ggrepel)
+library(scales)  # for rescale()
+library(ggdist)
+
+# modeling, model comparison and effect viualization
+library(brms)
+library(loo)
+library(tidybayes)
+library(bayestestR)
+library(emmeans) # estimated marginal means and contrasts
+library(MuMIn) # model selection and R2 calculations
+
+# Correlation, PCA and PLS analysis
+library(corrplot)
+library(factoextra)
+library(pls)
+
+# exporting results tables
+library(writexl)
+
+# always display the output at the end of the chunk
+knitr::opts_chunk$set(
+  results = "hold")
+
+```
+
+# 1.Preparation of data frames
+
+## 1.1 Load the data frames
+
+* stomatal control metrics
+* trait set: stomata density & size
+* trait set: leaf economic spectrum traits (LES)
+* drought response: leaf Dd13C 2018 - 2021
+* list of trees measured during the stomatal control campaign
+
+```{r load data, results="hide"}
+
+# We select only the trait measurements and leaf carbon isotope measurements of the very same trees
+
+# load the cleaned stomatal conductance data again, because we need
+# the IDs of the trees that have been measured during the stomatal conductance campaign
+trees_measured <- read_csv(here("data", "processed", "data_cleaned.csv")) %>% 
+  dplyr::select(tree_group, species, tree_id, tree_group) %>% 
+  distinct()
+
+tree_group_column <- trees_measured %>% dplyr::select(c(tree_group, species)) %>% distinct()
+
+
+# (1) load the stomatal behaviour metrics data with all draws and only species means:
+stomatal_behaviour_metrics <- 
+  read_csv(here("data", "processed", "stomatal_behaviour_metrics.csv"))
+
+stomatal_behaviour_species_metrics <- 
+  read_csv(here("data", "processed", "stomatal_behaviour_species_metrics.csv"))
+
+
+# (2) stomata anatomy data
+# angiosperm stomata
+traits_stomata_angio <- 
+  read_csv(here("data", "raw", "Kretz_Sachsenmaier_et_al_2026_angiosperm_stomatal_trait_data.csv")) %>% 
+  unite(tree_id, species_code, block, sep="-", remove=FALSE) %>% 
+    rename(species_full = species,
+         species = species_code) %>% 
+  dplyr::select(-c(GCPW, PW)) %>% 
+  # just for verifying that in the dataset of the stomata trait data are only trees for which gs was measured
+  semi_join(trees_measured, by = "tree_id")
+
+# gymnosperm stomata
+traits_stomata_gymno <- 
+  read_csv(here("data", "raw", "Sachsenmaier_et_al_2026_conifer_stomatal_trait_data.csv")) %>% 
+  dplyr::select(-c(SCL, SCW, SD_ab, SD_ad, SD_sbs, image_no_100x, image_no_1000x)) %>% 
+  # For gymnosperms, LI-600N measurements integrate all needle surfaces (because of the differnt chamber);
+  # therefore full-surface stomatal density (SD_fs) is used.
+  rename(SD = SD_fs) %>% 
+    separate(species, into = c("genus", "epithet"), sep = " ", remove = FALSE) %>%
+  mutate(species_code = paste0(substr(genus, 1, 3), "_", substr(epithet, 1, 3))) %>%
+  relocate(species_code, .after = species) %>% 
+  rename(species_full = species,
+         species = species_code) %>% 
+  dplyr::select(-c(epithet)) %>% 
+  # kick out all the tree individuals for which gs was NOT measured
+  mutate(kick_out = case_when(
+    tree_id== "Abi_alb_25_13" |
+    tree_id == "Lar_dec_25_12" |
+    tree_id == "Pin_nig_21_9" |
+    tree_id=="Pse_men_28_12" ~ TRUE,
+    species == "Tsu_can" ~ TRUE,
+    TRUE ~ FALSE)) %>% 
+  filter(kick_out==FALSE) %>% 
+  dplyr::select(-c(kick_out, GCPW, PW, genus))
+  
+  
+# (3) load the leaf functional trait data set:
+traits_leaf_morph <- 
+  read_csv(here("data", "raw","data_leaf_traits.csv")) %>% 
+  dplyr::select(c(species, block_ID, SLA, LDMC, 
+                  leaf_N_area, thickness, toughness)) %>%
+  separate(species, into = c("genus", "epithet"), sep = " ", remove = FALSE) %>%
+  mutate(sp = paste0(substr(genus, 1, 3), "_", substr(epithet, 1, 3))) %>% 
+  dplyr::select(-c(epithet)) %>% 
+    rename(species_full = species,
+           species = sp) %>% 
+  relocate(species, .after=species_full) %>% 
+  unite(tree_id, species, block_ID, sep="-", remove=FALSE) %>% 
+  # only keep the trees for which we also measured gs
+  semi_join(trees_measured, by = "tree_id")
+  
+
+# (4) leaf carbon isotope data set
+delta_d13C_species_means <- read_csv(here("data", "raw", "data_leaf_carbon_isotopes_2018_2021.csv"))
+
+
+```
+
+## 1.2. Preparation of the data frames
+
+Only retain trait measurements from individuals included in the
+stomatal conductance campaign to ensure trait and physiological
+measurements refer to the same sampled trees.
+
+### 1.2.1. Trait data frame
+
+```{r traits data frame}
+
+# join the stomata traits of gymno- and angiosperms
+# and calculate the species means
+traits_stomata <- traits_stomata_angio %>%
+  bind_rows(traits_stomata_gymno)
+
+rm(traits_stomata_angio, traits_stomata_gymno)
+
+
+traits_stomata_sp <- traits_stomata %>% 
+  group_by(species, species_full) %>% 
+  dplyr::summarize(
+            SD_sd = sd(SD),
+            GCL_sd = sd(GCL, na.rm=TRUE),
+            SD = mean(SD),
+            GCL = mean(GCL, na.rm=TRUE)
+) %>% 
+  ungroup() 
+
+
+# Leaf Economic Traits
+
+# Restrict the dataset to the trees used in the stomatal conductance campaign.
+# This ensures that leaf traits and stomatal behaviour metrics originate from the same
+# individuals before calculating species-level means.
+
+traits_leaf_morph_sp <- 
+  traits_leaf_morph %>%
+  group_by(species) %>% 
+  dplyr::summarize(
+            SLA_sd = sd(SLA),
+            LDMC_sd = sd(LDMC),
+            SLA = mean(SLA),
+            LDMC = mean(LDMC),
+            leaf_N_area_sd = sd(leaf_N_area),
+            leaf_N_area = mean(leaf_N_area),
+            thick_sd = sd(thickness),
+            thick = mean(thickness),
+            tough_sd = sd(toughness),
+            tough = mean(toughness)
+  ) %>% 
+  ungroup()
+
+
+
+# one full traits data frame:
+
+traits_df <- traits_stomata_sp %>% 
+  left_join(traits_leaf_morph_sp)
+
+
+```
+
+
+### 1.2.2. Physiological Drought Response 
+
+```{r Delta d13C df}
+
+drought_response_sp <- delta_d13C_species_means %>% dplyr::select(c(species, delta_d13C))
+
+```
+
+
+### 1.2.3. Data frames for models
+```{r dataframe for models}
+
+# Combine stomatal behaviour metrics, leaf traits, and drought response data.
+# Stomatal metrics contain posterior draws, whereas traits and δ13C are
+# species-level measurements.
+data_draws_full <- stomatal_behaviour_metrics %>%  
+  left_join(traits_df) %>% 
+  left_join(drought_response_sp) %>% 
+  left_join(tree_group_column)
+
+set.seed(123)
+# Randomly subsample posterior draws per species for downstream plotting
+# and trait regressions. This retains uncertainty while reducing object size.
+data_draws_sampled <- data_draws_full %>%
+  group_by(species) %>%
+  slice_sample(n = 100) %>%
+  ungroup()
+
+
+# only the mean dataframe
+data_mean <- 
+  stomatal_behaviour_species_metrics %>%
+    left_join(tree_group_column) %>% 
+    left_join(traits_df) %>% 
+    left_join(drought_response_sp)
+
+
+# Aggregate posterior draws to species level while retaining uncertainty.
+# The standard deviation of stomatal metrics represents posterior uncertainty,
+# which is later propagated in Bayesian models using se().
+
+data_for_models <- 
+  data_draws_full %>%
+  group_by(tree_group, species) %>%
+  summarise(
+    gs_max_mean = mean(gs_max),
+    gs_max_sd   = sd(gs_max),
+    
+    VPD_opt_mean = mean(VPD_opt),
+    VPD_opt_sd   = sd(VPD_opt),
+    
+    VPD50_mean = mean(VPD50),
+    VPD50_sd   = sd(VPD50),
+    
+    Sclosure_mean = mean(Sclosure),
+    Sclosure_sd   = sd(Sclosure),
+    
+    # Leaf traits
+    SD = mean(SD),
+    GCL = mean(GCL),
+    SLA = mean(SLA),
+    LDMC = mean(LDMC),
+    leaf_N_area = mean(leaf_N_area),
+    thick = mean(thick),
+    tough = mean(tough),
+    
+    # Physiological drought response
+    delta_d13C = mean(delta_d13C)
+  ) %>% 
+  ungroup() %>%
+  mutate(
+    tree_group = factor(tree_group),
+    
+    # Standardized predictors
+    SD_scaled = as.numeric(scale(SD)),
+    GCL_scaled = as.numeric(scale(GCL)),
+    SLA_scaled = as.numeric(scale(SLA)),
+    LDMC_scaled = as.numeric(scale(LDMC)),
+    thick_scaled = as.numeric(scale(thick)),
+    tough_scaled = as.numeric(scale(tough)),
+    leaf_N_area_scaled = as.numeric(scale(leaf_N_area)),
+    delta_d13C_scaled = as.numeric(scale(delta_d13C))
+  )
+
+
+```
+
+
+
+### 1.2.4. Tab. S7 - Trait table
+Nice table for Trait data (Supplementary Table S7)
+
+```{r supplementary data tables}
+
+# formatting function for the numbers in the supplementary table
+format_num <- function(x, digits) {
+  formatC(x, format = "f", digits = digits)
+}
+
+# Create nice table as supplementary
+
+trait_table <- data_mean %>%
+  dplyr::select(
+    species,
+    SD, SD_sd,
+    GCL, GCL_sd,
+    SLA, SLA_sd,
+    LDMC, LDMC_sd,
+    thick, thick_sd,
+    tough, tough_sd,
+    leaf_N_area, leaf_N_area_sd
+  ) %>%
+ mutate(
+    SD = paste0(format_num(SD, 2), " (±", format_num(SD_sd, 2), ")"),
+    GCL = paste0(format_num(GCL, 2), " (±", format_num(GCL_sd, 2), ")"),
+    SLA = paste0(format_num(SLA, 2), " (±", format_num(SLA_sd, 2), ")"),
+    LDMC = paste0(format_num(LDMC, 3), " (±", format_num(LDMC_sd, 3), ")"),
+    thick = paste0(format_num(thick, 3), " (±", format_num(thick_sd, 3), ")"),
+    tough = paste0(format_num(tough, 2), " (±", format_num(tough_sd, 2), ")"),
+    leaf_N_area = paste0(format_num(leaf_N_area, 4), " (±", format_num(leaf_N_area_sd, 4), ")")
+  ) %>%
+  dplyr::select(
+    species,
+    SD,
+    GCL,
+    SLA,
+    LDMC,
+    thick,
+    tough,
+    leaf_N_area
+  )
+
+write_xlsx(
+  trait_table,
+  here("output","Tab_S7_Trait_table.xlsx"
+))
+```
+
+
+
+# 2. Models
+
+## 2.1. Function for models
+
+```{r function for models}
+
+run_metric_models <- function(metrics, predictors, df, suffix = "") {
+  
+  for (m in metrics) {
+    for (p in predictors) {
+    # Response variables consist of the posterior mean and uncertainty
+    # of each stomatal behaviour metric.
+      metric_mean_col <- paste0(m, "_mean")
+      metric_sd_col <- paste0(m, "_sd")
+      
+      # Model names are used for saving fitted brms objects.
+      model_name <- paste0("model_", m, "_", p, suffix)
+          
+      message("Running model for Metric: ", m, " and Predictor: ", p, "...")
+    
+    # Model structure:
+    # stomatal metric uncertainty | trait × tree functional group interaction
+    #
+    # The interaction tests whether trait relationships differ between
+    # broadleaved and conifer species.
+    # sigma = TRUE means the provided uncertainty is known measurement error, but residual variance is still     # estimated.
+      
+      model_formula <- as.formula(
+        paste0(
+          metric_mean_col,
+          " | se(", metric_sd_col, ", sigma = TRUE) ~ ",
+          p,
+          " * tree_group"
+        )
+      )
+      # fit the model
+      fit <- brm(
+        formula = model_formula,
+        data = df,
+        chains = 4,
+        iter = 2000,
+        cores = 4,
+        file = here::here("output", "models", model_name),
+        file_refit = "on_change"
+      )
+    # Store models with informative names for later extraction of results
+    # and visualization.
+      assign(model_name, fit, envir = .GlobalEnv)
+    }
+  }
+}
+
+```
+
+
+
+## 2.2. Relationships between stomatal behaviour and leaf traits 
+
+```{r trait models}
+# Test whether leaf functional traits explain variation in stomatal behaviour metrics.
+# For each combination of stomatal metric and trait, a Bayesian linear model is fitted.
+# Species-level means are used as responses, while uncertainty in the estimated
+# stomatal metrics is propagated using the standard deviation of posterior draws.
+
+run_metric_models(
+  metrics = c("gs_max", "VPD_opt", "VPD50", "Sclosure"),
+  predictors = c("SD_scaled", "GCL_scaled", "SLA_scaled",
+                 "LDMC_scaled", "thick_scaled",
+                 "tough_scaled", "leaf_N_area_scaled"),
+  df = data_for_models
+)
+
+
+```
+
+
+## 2.3. Relationship between stomatal behaviour and leaf ∆δ13C
+
+```{r d13C models}
+
+# Test whether physiological drought response (δ13C) explains variation
+# in stomatal behaviour metrics.
+#
+# Each model uses species-level stomatal metrics with propagated posterior
+# uncertainty and tests whether the relationship differs between conifers
+# and broadleaved species.
+
+run_metric_models(
+  metrics = c("gs_max", "VPD_opt", "VPD50", "Sclosure"),
+  predictors = "delta_d13C_scaled",
+  df = data_for_models
+)
+
+```
+
+
+
+
+# 3. Main Figures
+## 3.1. Fig. 6 - Leaf traits effect size figure
+```{r leaf trait effect size figure}
+
+metrics <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+traits  <- c("SD_scaled", "GCL_scaled", "SLA_scaled", "LDMC_scaled", 
+             "thick_scaled", "tough_scaled", "leaf_N_area_scaled")
+
+summary_list_trait_models <- list()
+model_counter <- 1
+
+draws_list_trait_models <- list()
+
+for (m in metrics) {
+  for (t in traits) {
+    
+    original_model_name <- paste0("model_", m, "_", t)
+    file_path <- here::here("output", "models", paste0(original_model_name, ".rds"))
+    
+    if (!file.exists(file_path)) next
+    
+    fit <- readRDS(file_path)
+    
+    trait_scale_col <- t
+    
+    # Calculate Bayes R2
+    r2_val <- bayes_R2(fit)[1, "Estimate"]
+    
+    # Clean up names
+    clean_metric <- gsub("_scaled", "", m)
+    clean_trait  <- gsub("_scaled", "", t)
+    display_model_name <- paste0("Model ", model_counter)
+    
+    # Extract slopes via emtrends — same as your single panel figures
+    trends <- tryCatch(
+      as.data.frame(emtrends(fit, ~ tree_group, var = trait_scale_col)),
+      error = function(e) { warning(paste("emtrends failed for", original_model_name)); return(NULL) }
+    )
+    
+    if (is.null(trends)) next
+    
+    colnames(trends)[colnames(trends) == paste0(trait_scale_col, ".trend")] <- "trend"
+    
+ for (grp in c("broadleaved", "conifer")) {
+  
+  # Get full posterior draws for this group's slope
+  slope_draws <- fit %>% 
+    emtrends(~ tree_group, var = trait_scale_col) %>%
+    gather_emmeans_draws() %>%
+    filter(tree_group == grp) %>%
+    rename(slope = .value)
+  
+  if (nrow(slope_draws) == 0) next
+  
+  draws_list_trait_models[[length(draws_list_trait_models) + 1]] <- slope_draws %>%
+  mutate(
+    model_name = display_model_name,
+    metric     = clean_metric,
+    trait      = clean_trait,
+    tree_group = grp
+  )
+  
+  # Summarise with 95% credible interval
+  grp_summary <- slope_draws %>%
+    tidybayes::median_qi(slope, .width = 0.95)
+  
+  summary_list_trait_models[[length(summary_list_trait_models) + 1]] <- data.frame(
+    model_name = display_model_name,
+    metric     = clean_metric,
+    trait      = clean_trait,
+    tree_group = grp,
+    R2         = r2_val,
+    slope      = grp_summary$slope,
+    CI_lower   = grp_summary$.lower,
+    CI_upper   = grp_summary$.upper,
+    stringsAsFactors = FALSE
+  )
+}
+    
+    model_counter <- model_counter + 1
+  }
+}
+
+
+
+# Combine and apply rounding rules
+ 
+summary_table_trait_models <- 
+  bind_rows(summary_list_trait_models) %>% 
+  mutate(
+    R2       = round(R2, 2),
+    slope    = round(slope, 3),
+    CI_lower = round(CI_lower, 2),
+    CI_upper = round(CI_upper, 2)
+  )
+
+
+# Named vector for nice trait labels
+trait_labels <- c(
+  "SD"          = "Stomatal density",
+  "GCL"         = "Guard cell length",
+  "SLA"         = "Specific leaf area",
+  "LDMC"        = "Leaf dry matter content",
+  "thick"       = "Leaf thickness",
+  "tough"       = "Leaf toughness",
+  "leaf_N_area" = "Leaf nitrogen (per area)"
+)
+
+# Custom labeller for metrics using plotmath expressions
+metric_labeller <- as_labeller(
+  c(
+    "gs_max"  = "g[max]",
+    "VPD_opt"  = "VPD[opt]",
+    "VPD50"     = "VPD[50]",
+    "Sclosure"  = "S[closure]"
+  ),
+  default = label_parsed   # tells ggplot to parse as plotmath
+)
+
+
+
+correct_trait_levels  <- c("SD", "GCL", "SLA", "LDMC", "thick", "tough", "leaf_N_area")
+correct_metric_levels <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+
+plot_data <- summary_table_trait_models %>%
+  mutate(
+    tree_group = factor(tree_group, levels = c("conifer", "broadleaved")),
+    trait      = factor(trait,  levels = correct_trait_levels),
+    metric     = factor(metric, levels = correct_metric_levels)
+  )
+
+all_draws <- bind_rows(draws_list_trait_models) %>%
+  mutate(
+    tree_group = factor(tree_group, levels = c("conifer", "broadleaved")),
+    trait      = factor(trait,  levels = correct_trait_levels),
+    metric     = factor(metric, levels = correct_metric_levels)
+  )
+
+highlight_panels <- summary_table_trait_models %>%
+  group_by(metric, trait) %>%
+  summarise(highlight = any(CI_lower > 0 | CI_upper < 0), .groups = "drop") %>%
+  filter(highlight) %>%
+  mutate(
+    trait  = factor(trait,  levels = correct_trait_levels),
+    metric = factor(metric, levels = correct_metric_levels)
+  )
+
+featured_panels <- data.frame(
+  metric = c(
+    "gs_max", "gs_max", "gs_max", "gs_max",
+    "VPD_opt", "VPD_opt", "VPD_opt",
+    "VPD50",    "VPD50",    "VPD50",
+    "Sclosure", "Sclosure", "Sclosure"
+  ),
+  trait = c(
+    "SLA", "leaf_N_area", "thick", "tough",
+    "SD",  "SLA", "thick",
+    "SD",  "SLA", "thick",
+    "SD",  "SLA", "thick"
+  )
+) %>%
+  mutate(
+    trait  = factor(trait,  levels = correct_trait_levels),
+    metric = factor(metric, levels = correct_metric_levels)
+  )
+
+
+overall_effect_plot <- 
+  ggplot(all_draws, aes(x = slope, y = tree_group, color = tree_group, shape = tree_group)) +
+  
+    # Background highlight for panels with at least one credible effect
+  geom_rect(
+    data = highlight_panels,
+    aes(fill = highlight),
+    xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+    inherit.aes = FALSE,
+    fill = "grey92", color = NA
+  ) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+
+  stat_pointinterval(
+    .width = c(0.66, 0.95),
+    point_size = 2.5,
+    interval_size_range = c(0.6, 1.6), # thin (95% credible interval) vs thick (66% credible interval) line
+    alpha=0.5
+    ) +
+  
+  facet_grid(
+    rows  = vars(trait),
+    cols  = vars(metric),
+    scales = "free_x",
+    switch = "y",                          # moves row strips to the LEFT
+    labeller = labeller(
+      trait  = trait_labels,              # plain text names
+      metric = metric_labeller            # parsed plotmath for subscripts
+    )
+  ) +
+  
+  scale_color_manual(
+    values = c("broadleaved" = "#41624D", "conifer" = "#7798B9"),
+    labels = c("broadleaved" = "Broadleaved", "conifer" = "Conifer")
+  ) +
+  scale_shape_manual(
+    values = c("broadleaved" = 16, "conifer" = 17),
+    labels = c("broadleaved" = "Broadleaved", "conifer" = "Conifer")
+  ) +
+  
+  labs(
+    x     = "Slope estimate",
+    y     = NULL,
+    color = NULL,
+    shape = NULL
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background  = element_blank(),
+    strip.placement  = "outside",                        
+    strip.text.x      = element_text(face = "bold", size = 13),
+    strip.text.y.left = element_text(angle = 0, face = "bold", hjust = 1, size = 11),
+    panel.grid.minor = element_blank(),
+    panel.grid.major   = element_blank(),
+    legend.position  = "bottom",
+    axis.text.y      = element_blank(),
+    axis.ticks.y     = element_blank()
+  )
+
+
+ggsave(here("output", "Fig_6_effect_plot.png"),
+       overall_effect_plot, height = 6, width = 8, dpi=300)
+
+ggsave(here("output", "Figure_6.pdf"),
+       overall_effect_plot, height = 6, width = 8, dpi=1000)
+
+```
+
+
+## 3.2. Leaf Traits - single figures
+### 3.2.1. function for figures
+```{r model figures - function}
+
+metric_labels <- list(
+  "gs_max" = expression(
+    paste(
+      "Maximum ", italic(g)[s], " (", italic(g)[max],
+      "; mol ", m^-2, " ", s^-1, ")"
+    )
+  ),
+  "VPD_opt" = expression(
+    paste("VPD optimum (VPD", scriptscriptstyle(italic(opt)), ", kPa)")
+  ),
+  "VPD50" = expression(
+    paste("VPD tolerance (VPD", scriptscriptstyle(50), ", kPa)")
+  ),
+  "Sclosure" = expression(
+    paste("Closure rate (", italic(S)[closure], ")")
+  )
+)
+
+
+trait_labels <- list(
+  "SD"          = expression(paste("Stomatal Density (no. ", mm^-2, ")")),
+  "GCL"         = expression(paste("GCL(", mu, "m)")),
+  "SLA"         = expression(paste("SLA (", m^2, " ", kg^-1, ")")),
+  "LDMC"        = expression(paste("LDMC (mg ", g^-1, ")")),
+  "leaf_N_area" = expression(paste("Leaf N (", g, " ", m^-2, ")")),
+  "thick"       = "Leaf Thickness (mm)",
+  "tough"       = expression(paste("Leaf Toughness (N ", mm^-1, ")"))
+)
+
+
+generate_trait_panel <- function(metric, trait, raw_data, show_y_label = TRUE) {
+  
+  # 1. Identify model and load it from your saved output folder
+  model_name <- paste0("model_", metric, "_", trait, "_scaled")
+  file_path <- here::here("output", "models", paste0("model_", metric, "_", trait, "_scaled.rds"))
+  
+  if (!file.exists(file_path)) {
+    warning(paste("Model file not found:", file_path))
+    return(ggplot() + labs(title = paste("Missing:", model_name)) + theme_void())
+  }
+  
+  model <- readRDS(file_path)
+  
+  # Define variable column mappings from raw data
+  metric_mean_col <- paste0(metric, "_mean")
+  metric_sd_col   <- paste0(metric, "_sd")
+  trait_raw_col   <- trait 
+  trait_scale_col <- paste0(trait, "_scaled")
+  
+  # 2. Extract population levels trends & intercepts (on scaled space)
+  slopes_df     <- as.data.frame(emtrends(model, ~ tree_group, var = trait_scale_col))
+  colnames(slopes_df)[colnames(slopes_df) == paste0(trait_scale_col, ".trend")] <- "trend"
+  
+  at_list <- list(); at_list[[trait_scale_col]] <- 0
+  intercepts_df <- as.data.frame(emmeans(model, ~ tree_group, at = at_list))
+  
+  angio_int   <- intercepts_df %>% filter(tree_group == "broadleaved") %>% pull(emmean)
+  angio_slp   <- slopes_df %>% filter(tree_group == "broadleaved") %>% pull(trend)
+  conifer_int <- intercepts_df %>% filter(tree_group == "conifer") %>% pull(emmean)
+  conifer_slp <- slopes_df %>% filter(tree_group == "conifer") %>% pull(trend)
+
+  
+    # Summarize posterior slope distributions using 90% and 95% credible intervals.
+    # These intervals determine whether relationships are classified as significant
+    # or marginal.  
+  slope_draws <- model %>% emtrends(~ tree_group, var = trait_scale_col) %>%
+  gather_emmeans_draws()
+  
+  colnames(slope_draws)[colnames(slope_draws) == ".value"] <- "slope"
+  
+  # --- FIXED: Force .width to text to prevent R from dropping trailing zeros ---
+  ci_summary <- slope_draws %>% 
+    group_by(tree_group) %>% 
+    tidybayes::median_qi(slope, .width = c(0.66, 0.95)) %>%
+    dplyr::select(tree_group, .width, .lower, .upper) %>%
+    dplyr::mutate(.width = ifelse(.width == 0.95, "95", "66")) %>% # Explicitly stringify
+    tidyr::pivot_wider(
+      names_from = .width, 
+      values_from = c(.lower, .upper),
+      names_sep = "_"
+    )
+  
+  
+  determine_status <- function(lower_95, upper_95, lower_66, upper_66) {
+    if ((lower_95 > 0 && upper_95 > 0) || (lower_95 < 0 && upper_95 < 0)) {
+      return("significant")
+    } else if ((lower_66 > 0 && upper_66 > 0) || (lower_66 < 0 && upper_66 < 0)) {
+      return("marginal")
+    } else {
+      return("none")
+    }
+  }
+  
+  angio_ci <- ci_summary %>% filter(tree_group == "broadleaved")
+  conifer_ci <- ci_summary %>% filter(tree_group == "conifer")
+  
+  # Safely pull the explicitly named text columns
+  angio_status <- determine_status(
+    pull(angio_ci, .lower_95), pull(angio_ci, .upper_95), 
+    pull(angio_ci, .lower_66), pull(angio_ci, .upper_66)
+  )
+  conifer_status <- determine_status(
+    pull(conifer_ci, .lower_95), pull(conifer_ci, .upper_95), 
+    pull(conifer_ci, .lower_66), pull(conifer_ci, .upper_66)
+  )
+  # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  # -------------------------------------------------------------------------
+  
+  intercept_draws <- model %>% emmeans(~ tree_group, at = at_list) %>% gather_emmeans_draws()
+  colnames(intercept_draws)[colnames(intercept_draws) == ".value"] <- "intercept"
+  
+  all_lines <- inner_join(
+    intercept_draws, slope_draws,
+    by = c("tree_group", ".chain", ".iteration", ".draw")
+  )
+  
+  set.seed(123)
+  random_draws <- sample(unique(all_lines$.draw), 200)
+  cloud_data   <- all_lines %>% filter(.draw %in% random_draws)
+  
+  mean_trait <- mean(raw_data[[trait_raw_col]], na.rm = TRUE)
+  sd_trait   <- sd(raw_data[[trait_raw_col]], na.rm = TRUE)
+  
+  cloud_data <- cloud_data %>% 
+    mutate(
+      slope_unscaled = slope / sd_trait,
+      intercept_unscaled = intercept - (slope * mean_trait / sd_trait)
+    )
+  
+  angio_color <- "#41624D"; angio_cloud_color = "#A9C7A9"
+    conifer_color <- "#7798B9"; conifer_cloud_color <- "lightblue3"
+
+
+
+  # --- CHANGED: Map status to linetype and filter out "none" ---
+  mean_lines <- data.frame(
+    tree_group = c("broadleaved", "conifer"),
+    intercept_mean = c(angio_int - (angio_slp * mean_trait / sd_trait), 
+                       conifer_int - (conifer_slp * mean_trait / sd_trait)),
+    slope_mean = c(angio_slp / sd_trait, 
+                   conifer_slp / sd_trait),
+    line_color = c(angio_color, conifer_color),
+    status = c(angio_status, conifer_status)
+  )
+  
+  # Keep both significant and marginal lines
+  mean_lines <- mean_lines %>% filter(status %in% c("significant", "marginal"))
+  # --------------------------------------------------------------
+  
+  angio_cloud   <- cloud_data %>% filter(tree_group == "broadleaved")
+  conifer_cloud <- cloud_data %>% filter(tree_group == "conifer")
+  
+  angio_raw   <- raw_data %>% filter(tree_group == "broadleaved")
+  conifer_raw <- raw_data %>% filter(tree_group == "conifer")
+  
+  x_label <- if (trait %in% names(trait_labels)) trait_labels[[trait]] else trait
+  
+  y_label <- NULL
+  if (show_y_label) {
+    y_label <- if (metric %in% names(metric_labels)) metric_labels[[metric]] else metric
+  }
+  
+  # Build the plot
+  p <- ggplot() +
+    geom_abline(data = conifer_cloud, 
+                aes(intercept = intercept_unscaled, 
+                    slope = slope_unscaled), 
+                color = conifer_cloud_color, 
+                alpha = 0.2, 
+                linewidth = 0.3) + 
+    geom_errorbar(data = conifer_raw, 
+                  aes(x = .data[[trait_raw_col]],
+                      ymin = .data[[metric_mean_col]] - .data[[metric_sd_col]], 
+                      ymax = .data[[metric_mean_col]] + .data[[metric_sd_col]]),
+                  color = "gray50", 
+                  width = 0, 
+                  alpha = 0.5) +
+    geom_point(data = conifer_raw, 
+               aes(x = .data[[trait_raw_col]], 
+                   y = .data[[metric_mean_col]], 
+                   size = 1/.data[[metric_sd_col]]),
+               color = conifer_color, 
+               alpha = 0.6, 
+               shape = 17) +
+    
+    geom_abline(data = angio_cloud, 
+                aes(intercept = intercept_unscaled, 
+                    slope = slope_unscaled), 
+                color = angio_cloud_color, 
+                alpha = 0.2, 
+                linewidth = 0.3) + 
+    
+    geom_errorbar(data = angio_raw, 
+                  aes(x = .data[[trait_raw_col]], 
+                      ymin = .data[[metric_mean_col]] - .data[[metric_sd_col]], 
+                      ymax = .data[[metric_mean_col]] + .data[[metric_sd_col]]), 
+                  color = "gray50", 
+                  width = 0, 
+                  alpha = 0.5) +
+    
+    geom_point(data = angio_raw, 
+               aes(x = .data[[trait_raw_col]], 
+                   y = .data[[metric_mean_col]], 
+                   size = 1/.data[[metric_sd_col]]), 
+               color = angio_color, 
+               alpha = 0.6,
+               shape = 16) +
+    
+    # --- CHANGED: Dynamic linetype based on status mapping ---
+    geom_abline(data = mean_lines, 
+                aes(intercept = intercept_mean, 
+                    slope = slope_mean, 
+                    color = line_color, 
+                    linetype = status),
+                linewidth = 1.0) +
+    
+    scale_linetype_manual(values = c("significant" = "solid", "marginal" = "dashed")) +
+    # ---------------------------------------------------------
+    scale_size_continuous(range = c(1, 4)) +
+    scale_color_identity() + 
+    labs(x = x_label, y = y_label) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      strip.background = element_rect(fill = "gray95", color = NA),
+      strip.text = element_text(face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    facet_wrap(~ factor(tree_group, levels = c("broadleaved", "conifer")), nrow = 1, scales = "free_x")
+  
+  if (!show_y_label) {
+    p <- p + theme(
+      axis.title.y = element_blank(),
+      axis.text.y  = element_blank(),
+      axis.ticks.y = element_blank(),
+    )
+  }
+  
+  return(p)
+}
+
+```
+
+### 3.2.2. Fig. 7 - Leaf traits & Max. capacity figure
+
+```{r gs max figure}
+# Generate the individual panels
+p_sla   <- generate_trait_panel(metric = "gs_max", trait = "SLA",         raw_data = data_for_models)
+p_leafn <- generate_trait_panel(metric = "gs_max", trait = "leaf_N_area", raw_data = data_for_models, show_y_label =F)
+p_thick <- generate_trait_panel(metric = "gs_max", trait = "thick",       raw_data = data_for_models, show_y_label =F)
+p_tough <- generate_trait_panel(metric = "gs_max", trait = "tough",       raw_data = data_for_models, show_y_label =F)
+
+
+fig_gsmax <- (p_sla | p_leafn | p_thick | p_tough) +
+  plot_annotation(
+    tag_levels = "a", 
+    tag_prefix = "(", 
+    tag_suffix = ")"
+  ) &
+   theme(
+     plot.tag = element_text(face = "bold", size = 12),
+     strip.text = element_text(size = 9),
+     axis.title = element_text(size = 12),
+     panel.spacing = unit(0.5, "lines"),
+     panel.grid.major = element_blank(),
+     panel.grid.minor = element_blank()
+   )
+
+fig_gsmax
+
+ggsave(here("output", "Fig_7_gs_max.png"), fig_gsmax, height=4, width=9, dpi=300)
+
+ggsave(here("output", "Figure_7.pdf"), fig_gsmax, height=4, width=9, dpi=1000)
+
+```
+
+### 3.2.3. Fig. 8 - Leaf traits & Stomatal sensitivity figure
+```{r model figures - SLA}
+
+### Row 1: VPD optimum (VPD_opt)
+p_vpd_sd    <- generate_trait_panel("VPD_opt", "SD",    data_for_models, show_y_label = TRUE)
+p_vpd_sla   <- generate_trait_panel("VPD_opt", "SLA",   data_for_models, show_y_label = FALSE)
+p_vpd_thick <- generate_trait_panel("VPD_opt", "thick", data_for_models, show_y_label = FALSE)
+p_vpd_tough <- generate_trait_panel("VPD_opt", "tough", data_for_models, show_y_label = FALSE)
+
+### Row 2: VPD tolerance (VPD50)
+p_v50_sd    <- generate_trait_panel("VPD50",    "SD",    data_for_models, show_y_label = TRUE)
+p_v50_sla   <- generate_trait_panel("VPD50",    "SLA",   data_for_models, show_y_label = FALSE)
+p_v50_thick <- generate_trait_panel("VPD50",    "thick", data_for_models, show_y_label = FALSE)
+p_v50_tough <- generate_trait_panel("VPD50",    "tough", data_for_models, show_y_label = FALSE)
+
+### Row 3: Closure rate (Sclosure)
+p_sdec_sd    <- generate_trait_panel("Sclosure", "SD",    data_for_models, show_y_label = TRUE)
+p_sdec_sla   <- generate_trait_panel("Sclosure", "SLA",   data_for_models, show_y_label = FALSE)
+p_sdec_thick <- generate_trait_panel("Sclosure", "thick", data_for_models, show_y_label = FALSE)
+p_sdec_tough <- generate_trait_panel("Sclosure", "tough", data_for_models, show_y_label = FALSE)
+
+# Arrange into a 3x4 layout grid using patchwork wrapping
+fig_vpd_traits <- (
+  p_vpd_sd  | p_vpd_sla  | p_vpd_thick  |
+  p_v50_sd  | p_v50_sla  | p_v50_thick  |
+  p_sdec_sd | p_sdec_sla | p_sdec_thick 
+) + 
+  plot_layout(ncol = 3, nrow =3) +
+  plot_annotation(
+    tag_levels = "a", 
+    tag_prefix = "(", 
+    tag_suffix = ")"
+  ) &
+   theme(
+     plot.tag = element_text(face = "bold", size = 12),
+     strip.text = element_text(size = 9),
+     axis.title = element_text(size = 10),
+     panel.spacing = unit(0.5, "lines")
+   )
+
+fig_vpd_traits
+
+ggsave(
+  here::here("output", "Fig_8_vpd_metrics.png"), 
+  fig_vpd_traits, 
+  height = 10, 
+  width = 8
+)
+
+
+```
+
+
+## 3.3. Physiological drought response
+
+
+### 3.3.1. Reload the saved models
+
+```{r reload the models}
+ 
+load_metric_models <- function(metrics, predictors, suffix = "") {
+  for (m in metrics) {
+    for (p in predictors) {
+      model_name <- paste0("model_", m, "_", p, suffix)
+      path <- here::here("output", "models", paste0(model_name, ".rds"))
+
+      if (!file.exists(path)) {
+        stop("Model file not found: ", path, 
+             "\nRun run_metric_models() first to fit and save it.")
+      }
+
+      assign(model_name, readRDS(path), envir = .GlobalEnv)
+      message("Loaded: ", model_name)
+    }
+  }
+}
+
+# usage in the figures script:
+load_metric_models(
+  metrics    = c("gs_max", "VPD_opt", "VPD50", "Sclosure"),
+  predictors = "delta_d13C_scaled"
+)
+
+```
+
+### 3.3.2. Data preparation and figure function
+```{r data preparation d13C figure }
+
+# shared styles
+conifer_color       <- "#7798B9"
+conifer_cloud_color <- "lightblue3"
+angio_color         <- "#41624D"
+angio_cloud_color   <- "#A9C7A9"
+
+
+
+# Extract everything needed for one model: pooled fits, posterior draw
+#    clouds (unscaled), Bayes R2, and slope significance text.
+# ------------------------------------------------------------------------------
+extract_drought_fit <- function(model, mean_d13C, sd_d13C,
+                                 n_draws = 200, seed = 123) {
+ 
+  slopes_df     <- as.data.frame(emtrends(model, ~ tree_group, var = "delta_d13C_scaled"))
+  intercepts_df <- as.data.frame(emmeans(model, ~ tree_group, at = list(delta_d13C_scaled = 0)))
+ 
+  pull_by_group <- function(df, group, col) {
+    df %>% filter(tree_group == group) %>% pull({{ col }})
+  }
+ 
+  angio_int   <- pull_by_group(intercepts_df, "broadleaved", emmean)
+  angio_slp   <- pull_by_group(slopes_df,     "broadleaved", delta_d13C_scaled.trend)
+  conifer_int <- pull_by_group(intercepts_df, "conifer",     emmean)
+  conifer_slp <- pull_by_group(slopes_df,     "conifer",     delta_d13C_scaled.trend)
+ 
+  # Posterior draws for the uncertainty clouds
+  slope_draws <- model %>%
+    emtrends(~ tree_group, var = "delta_d13C_scaled") %>%
+    gather_emmeans_draws()
+ 
+  intercept_draws <- model %>%
+    emmeans(~ tree_group, at = list(delta_d13C_scaled = 0)) %>%
+    gather_emmeans_draws()
+ 
+  all_lines <- inner_join(
+    intercept_draws %>% rename(intercept = .value),
+    slope_draws     %>% rename(slope = .value),
+    by = c("tree_group", ".chain", ".iteration", ".draw")
+  )
+ 
+  set.seed(seed)
+  random_draws <- sample(unique(all_lines$.draw), n_draws)
+  cloud_data   <- all_lines %>% filter(.draw %in% random_draws)
+ 
+  unscale_cloud <- function(cloud) {
+    cloud %>%
+      mutate(
+        slope_unscaled     = slope / sd_d13C,
+        intercept_unscaled = intercept - (slope * mean_d13C / sd_d13C)
+      )
+  }
+ 
+  angio_cloud   <- cloud_data %>% filter(tree_group == "broadleaved") %>% unscale_cloud()
+  conifer_cloud <- cloud_data %>% filter(tree_group == "conifer")     %>% unscale_cloud()
+ 
+  # Unscale the main pooled regression lines
+  angio_slp_unscaled   <- angio_slp / sd_d13C
+  angio_int_unscaled   <- angio_int - (angio_slp * mean_d13C / sd_d13C)
+  conifer_slp_unscaled <- conifer_slp / sd_d13C
+  conifer_int_unscaled <- conifer_int - (conifer_slp * mean_d13C / sd_d13C)
+ 
+  # Bayes R2
+  r2_val  <- bayes_R2(model)[1, "Estimate"]
+  r2_text <- paste0("Bayes R² = ", round(r2_val, 2))
+ 
+  # Slope summaries and classification based on 95% and 66% HPD intervals
+slope_summary_95 <- as.data.frame(
+  emtrends(
+    model,
+    ~ tree_group,
+    var = "delta_d13C_scaled",
+    level = 0.95
+  )
+)
+
+slope_summary_66 <- as.data.frame(
+  emtrends(
+    model,
+    ~ tree_group,
+    var = "delta_d13C_scaled",
+    level = 0.66
+  )
+)
+
+get_slope_status <- function(group) {
+  
+  ci95 <- slope_summary_95 %>%
+    filter(tree_group == group)
+  
+  ci66 <- slope_summary_66 %>%
+    filter(tree_group == group)
+  
+  if ((ci95$lower.HPD > 0 && ci95$upper.HPD > 0) ||
+      (ci95$lower.HPD < 0 && ci95$upper.HPD < 0)) {
+    "significant"
+    
+  } else if ((ci66$lower.HPD > 0 && ci66$upper.HPD > 0) ||
+             (ci66$lower.HPD < 0 && ci66$upper.HPD < 0)) {
+    "marginal"
+    
+  } else {
+    "none"
+  }
+}
+
+make_sig_text <- function(group) {
+  trend <- slope_summary_95 %>%
+    filter(tree_group == group)
+  
+  sprintf(
+    "Slope = %.2f [%.2f, %.2f]",
+    trend$delta_d13C_scaled.trend,
+    trend$lower.HPD,
+    trend$upper.HPD
+  )
+}
+
+angio_status   <- get_slope_status("broadleaved")
+conifer_status <- get_slope_status("conifer")
+ 
+list(
+  angio_cloud            = angio_cloud,
+  conifer_cloud          = conifer_cloud,
+  angio_int_unscaled     = angio_int_unscaled,
+  angio_slp_unscaled     = angio_slp_unscaled,
+  conifer_int_unscaled   = conifer_int_unscaled,
+  conifer_slp_unscaled   = conifer_slp_unscaled,
+  r2_text                = r2_text,
+  angio_sig              = make_sig_text("broadleaved"),
+  conifer_sig            = make_sig_text("conifer"),
+  angio_status            = angio_status,
+  conifer_status          = conifer_status
+)
+}
+
+
+
+
+# figure function
+build_drought_panel <- function(raw_data, fit, mean_col, sd_col, y_lab,
+                                 show_conifer_fit = FALSE,
+                                 show_angio_fit   = FALSE,
+                                 halo             = FALSE,
+                                 angio_suffix     = "",
+                                 conifer_suffix   = "") {
+ 
+  conifer_raw <- raw_data %>% filter(tree_group == "conifer")
+  angio_raw   <- raw_data %>% filter(tree_group == "broadleaved")
+ 
+  p <- ggplot() +
+    geom_abline(data = fit$conifer_cloud,
+                aes(intercept = intercept_unscaled, slope = slope_unscaled),
+                color = conifer_cloud_color, alpha = 0.3, linewidth = 0.3) +
+    geom_abline(data = fit$angio_cloud,
+                aes(intercept = intercept_unscaled, slope = slope_unscaled),
+                color = angio_cloud_color, alpha = 0.3, linewidth = 0.3) +
+    geom_errorbar(data = conifer_raw,
+                  aes(x = delta_d13C,
+                      ymin = .data[[mean_col]] - .data[[sd_col]],
+                      ymax = .data[[mean_col]] + .data[[sd_col]]),
+                  color = "gray50", width = 0, alpha = 0.6) +
+    geom_errorbar(data = angio_raw,
+                  aes(x = delta_d13C,
+                      ymin = .data[[mean_col]] - .data[[sd_col]],
+                      ymax = .data[[mean_col]] + .data[[sd_col]]),
+                  color = "gray50", width = 0, alpha = 0.6)
+ 
+
+# White halo only behind 95% credible (solid) fit lines
+if (halo) {
+  
+  if (show_conifer_fit && fit$conifer_status == "significant") {
+    p <- p + geom_abline(
+      intercept = fit$conifer_int_unscaled,
+      slope = fit$conifer_slp_unscaled,
+      color = "white",
+      linewidth = 2.0,
+      linetype = "solid"
+    )
+  }
+  
+  if (show_angio_fit && fit$angio_status == "significant") {
+    p <- p + geom_abline(
+      intercept = fit$angio_int_unscaled,
+      slope = fit$angio_slp_unscaled,
+      color = "white",
+      linewidth = 2.0,
+      linetype = "solid"
+    )
+  }
+}
+ 
+  p <- p +
+    geom_point(data = conifer_raw,
+               aes(x = delta_d13C, y = .data[[mean_col]], size = 1 / .data[[sd_col]]),
+               color = conifer_color, alpha = 0.8, shape = 17) +
+    geom_point(data = angio_raw,
+               aes(x = delta_d13C, y = .data[[mean_col]], size = 1 / .data[[sd_col]]),
+               color = angio_color, alpha = 0.8)
+ 
+    if (show_conifer_fit && fit$conifer_status != "none") {
+      p <- p + geom_abline(
+        intercept = fit$conifer_int_unscaled,
+        slope = fit$conifer_slp_unscaled,
+        color = conifer_color,
+        linewidth = 1.2,
+        linetype = ifelse(
+          fit$conifer_status == "marginal",
+          "dashed",
+          "solid"
+        )
+      )
+    }
+    
+    if (show_angio_fit && fit$angio_status != "none") {
+      p <- p + geom_abline(
+        intercept = fit$angio_int_unscaled,
+        slope = fit$angio_slp_unscaled,
+        color = angio_color,
+        linewidth = 1.2,
+        linetype = ifelse(
+          fit$angio_status == "marginal",
+          "dashed",
+          "solid"
+        )
+      )
+    }
+ 
+  p +
+    annotate("text", x = Inf, y = Inf, label = fit$r2_text,
+             hjust = 1, vjust = 1.5, color = "black", fontface = "plain", size = 4) +
+    annotate("text", x = Inf, y = Inf,
+             label = paste0("Broadl.: ", fit$angio_sig, angio_suffix),
+             hjust = 1, vjust = 3.2, color = angio_color, fontface = "plain", size = 3.8) +
+    annotate("text", x = Inf, y = Inf,
+             label = paste0("Conifer: ", fit$conifer_sig, conifer_suffix),
+             hjust = 1, vjust = 4.9, color = conifer_color, fontface = "plain", size = 3.8) +
+    labs(
+      x = expression(atop("Physiol. drought response",
+        (Delta * delta^13 * "C"["2018-2021"]))),
+      y = y_lab
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+}
+
+
+
+```
+
+### 3.3.3. Fig. 5 - Stomatal behaviour & drought response
+```{r figures d13C}
+
+mean_d13C <- mean(data_for_models$delta_d13C, na.rm = TRUE)
+sd_d13C   <- sd(data_for_models$delta_d13C, na.rm = TRUE)
+ 
+fit_gsmax      <- extract_drought_fit(model_gs_max_delta_d13C_scaled,      mean_d13C, sd_d13C)
+fit_VPDoptimum <- extract_drought_fit(model_VPD_opt_delta_d13C_scaled, mean_d13C, sd_d13C)
+fit_VPD50      <- extract_drought_fit(model_VPD50_delta_d13C_scaled,      mean_d13C, sd_d13C)
+fit_Sclosure   <- extract_drought_fit(model_Sclosure_delta_d13C_scaled,   mean_d13C, sd_d13C)
+ 
+ 
+# gs_max: no fitted lines drawn, no significance suffixes
+figure_Dd13C_gsmax <- build_drought_panel(
+  data_for_models, fit_gsmax, "gs_max_mean", "gs_max_sd",
+  y_lab = expression(
+    paste(
+      "Maximum ", italic(g)[s], " (", italic(g)[max],
+      "; mol ", m^-2, " ", s^-1, ")"
+    )
+  ),
+  show_conifer_fit = TRUE,
+  show_angio_fit   = TRUE,
+  halo             = FALSE
+)
+
+# VPDoptimum: both fit lines shown, with white halo, both starred
+figure_Dd13C_VPDopt <- build_drought_panel(
+  data_for_models, fit_VPDoptimum, "VPD_opt_mean", "VPD_opt_sd",
+  y_lab            = expression("VPD optimum (VPD"["opt"]*")"),
+  show_conifer_fit = TRUE,
+  show_angio_fit   = TRUE,
+  halo             = TRUE,
+  angio_suffix     = "*",
+  conifer_suffix   = "*"
+)
+ 
+# VPD50: only conifer fit line shown (with halo), conifer starred
+figure_Dd13C_VPD50 <- build_drought_panel(
+  data_for_models, fit_VPD50, "VPD50_mean", "VPD50_sd",
+  y_lab            = expression("VPD at half-closure (VPD"["50"]*")"),
+  show_conifer_fit = TRUE,
+  show_angio_fit   = TRUE,
+  halo             = TRUE,
+  angio_suffix     = " ",
+  conifer_suffix   = "*"
+)
+ 
+# Sclosure: no fitted lines, no suffixes
+figure_Dd13C_Sclosure <- build_drought_panel(
+  data_for_models, fit_Sclosure, "Sclosure_mean", "Sclosure_sd",
+  y_lab = expression("Closure rate (S"["closure"]*")"),
+  show_conifer_fit = TRUE,
+  show_angio_fit   = TRUE,
+  halo             = TRUE,
+)
+ 
+
+# Combined drought figure
+
+fig_Dd13C <- (
+  figure_Dd13C_gsmax +
+  figure_Dd13C_VPDopt +
+  figure_Dd13C_VPD50 +
+  figure_Dd13C_Sclosure
+) +
+  plot_layout(nrow = 1) +
+  plot_annotation(
+    tag_levels = "a",
+    tag_prefix = "(",
+    tag_suffix = ")"
+  ) &
+  theme(
+    plot.tag  = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 12),
+    axis.text.x = element_text(size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.line = element_line(colour = "black"),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.spacing = unit(0.5, "lines"),
+  )
+fig_Dd13C
+ 
+ggsave(
+  here("output", "Fig_5_Model_Dd13C.png"),
+  fig_Dd13C, height = 7, width = 15, dpi=300
+)
+
+ggsave(
+  here("output", "Figure_5.pdf"),
+  fig_Dd13C, height = 7, width = 15, dpi=1000
+)
+
+
+
+
+```
+
+
+
+
+# 4. Supplementary Figures
+
+## 4.1. Fig. S11 - PCA Leaf Traits 
+
+```{r pca leaf traits}
+
+tree_group_info <- data_mean %>% dplyr::select(species, tree_group) %>% distinct() %>% ungroup()
+
+# only angio
+
+data_pca <- data_mean %>%
+  filter(tree_group=="broadleaved") %>% 
+  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
+  as.data.frame()
+
+species_names <- data_mean %>% 
+  filter(tree_group=="broadleaved") %>% 
+  pull(species)
+
+rownames(data_pca) <- species_names
+
+pca_res <- prcomp(data_pca, 
+                  center = TRUE, 
+                  scale. = TRUE)
+
+
+# 1. Extract Individual Scores (the points)
+ind_coords <- as.data.frame(pca_res$x)
+ind_coords$species <- rownames(ind_coords)
+ind_coords <- ind_coords %>% left_join(tree_group_info)
+
+# 2. Extract Variable Loadings (the arrows)
+# We multiply by a scaling factor so arrows are visible on the same scale as points
+var_coords <- as.data.frame(pca_res$rotation)
+var_coords$var_names <- rownames(var_coords)
+
+# flip both axes for angio so trait directions match gymno's orientation
+ind_coords$PC1 <- -ind_coords$PC1
+ind_coords$PC2 <- -ind_coords$PC2
+var_coords$PC1 <- -var_coords$PC1
+var_coords$PC2 <- -var_coords$PC2
+
+# extract the scores
+pca_scores_angio <- ind_coords %>%
+  dplyr::select(species, PC1, PC2)
+
+mult <- min(
+  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
+    (max(var_coords$PC1) - min(var_coords$PC1)),
+  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
+    (max(var_coords$PC2) - min(var_coords$PC2))
+) * 0.7 # Adjust this multiplier to change arrow length
+
+# 1. Calculate percentage of variance
+# sdev is the square root of the eigenvalues
+pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
+
+pca_traits_angio <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
+      # Styling to match fviz_pca
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+  # Variable arrows
+  geom_segment(data = var_coords, 
+               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "black", linewidth = 0.7) +
+  
+  # Variable labels
+  geom_text_repel(data = var_coords, 
+                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
+                  color = "black", fontface = "bold", size = 4) +
+  
+  # Individual points & labels
+  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
+  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
+    
+  scale_colour_manual(
+    values = c(
+      "broadleaved" = "#41624D",
+      "conifer" = "#7798B9"
+    )
+  ) +
+    scale_shape_manual(
+    values = c(
+      "broadleaved" = 16,
+      "conifer" = 17
+    )
+  ) +
+theme_minimal() +
+labs(x = pc1_lab, y = pc2_lab) +
+# coord_cartesian(xlim = x_limits, ylim = y_limits) +
+coord_fixed() +
+theme(legend.position = "none")
+pca_traits_angio
+
+
+
+# only gymno
+
+data_pca <- data_mean %>%
+  filter(tree_group=="conifer") %>% 
+  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
+  as.data.frame()
+
+species_names <- data_mean %>% 
+  filter(tree_group=="conifer") %>%
+  pull(species)
+
+rownames(data_pca) <- species_names
+
+pca_res <- prcomp(data_pca, 
+                  center = TRUE, 
+                  scale. = TRUE)
+
+
+# 1. Extract Individual Scores (the points)
+ind_coords <- as.data.frame(pca_res$x)
+ind_coords$species <- rownames(ind_coords)
+ind_coords <- ind_coords %>% left_join(tree_group_info)
+
+# extract the scores
+pca_scores_gymno <- ind_coords %>%
+  dplyr::select(species, PC1, PC2)
+
+
+# 2. Extract Variable Loadings (the arrows)
+# We multiply by a scaling factor (e.g., 5) so arrows are visible on the same scale as points
+var_coords <- as.data.frame(pca_res$rotation)
+var_coords$var_names <- rownames(var_coords)
+mult <- min(
+  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
+    (max(var_coords$PC1) - min(var_coords$PC1)),
+  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
+    (max(var_coords$PC2) - min(var_coords$PC2))
+) * 0.7 # Adjust this multiplier to change arrow length
+
+
+
+
+
+# 1. Calculate percentage of variance
+# sdev is the square root of the eigenvalues
+pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
+
+
+
+pca_traits_gymno <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
+  
+  # Styling to match fviz_pca
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    # Variable arrows
+  geom_segment(data = var_coords, 
+               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "black", linewidth = 0.7) +
+  
+  # Variable labels
+  geom_text_repel(data = var_coords, 
+                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
+                  color = "black", fontface = "bold", size = 4) +
+  # Individual points & labels
+  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
+  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
+    
+  scale_colour_manual(
+    values = c(
+      "broadleaved" = "#41624D",
+      "conifer" = "#7798B9"
+    )
+  ) +
+    scale_shape_manual(
+    values = c(
+      "broadleaved" = 16,
+      "conifer" = 17
+    )
+  ) +
+theme_minimal() +
+labs(x = pc1_lab, y = pc2_lab) +
+# coord_cartesian(xlim = x_limits, ylim = y_limits) +
+coord_fixed() +
+theme(legend.position = "none")
+
+pca_traits_gymno
+
+
+# joined figure
+PCA_all_leaf_traits_separated <- 
+  pca_traits_angio +
+  pca_traits_gymno +
+  plot_layout(nrow(1))
+
+ggsave(here("output", "Figure_S11_PCA_leaf_traits.png"), PCA_all_leaf_traits_separated, height=7, width=11)
+
+
+# extract the PCA scors
+pca_scores_separate <- bind_rows(
+  pca_scores_angio,
+  pca_scores_gymno
+)
+
+
+
+# PCA overall
+
+data_pca <- data_mean %>%
+  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
+  as.data.frame()
+
+species_names <- data_mean %>% 
+  pull(species)
+
+rownames(data_pca) <- species_names
+
+pca_res <- prcomp(data_pca, 
+                  center = TRUE, 
+                  scale. = TRUE)
+
+
+# 1. Extract Individual Scores (the points)
+ind_coords <- as.data.frame(pca_res$x)
+ind_coords$species <- rownames(ind_coords)
+ind_coords <- ind_coords %>% left_join(tree_group_info)
+
+
+# 2. Extract Variable Loadings (the arrows)
+# We multiply by a scaling factor (e.g., 5) so arrows are visible on the same scale as points
+var_coords <- as.data.frame(pca_res$rotation)
+var_coords$var_names <- rownames(var_coords)
+mult <- min(
+  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
+    (max(var_coords$PC1) - min(var_coords$PC1)),
+  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
+    (max(var_coords$PC2) - min(var_coords$PC2))
+) * 0.7 # Adjust this multiplier to change arrow length
+
+
+# 1. Calculate percentage of variance
+# sdev is the square root of the eigenvalues
+pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
+
+
+
+pca_traits_both <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
+  
+  # Styling to match fviz_pca
+    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
+    # Variable arrows
+  geom_segment(data = var_coords, 
+               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
+               arrow = arrow(length = unit(0.2, "cm")), 
+               color = "black", linewidth = 0.7) +
+  
+  # Variable labels
+  geom_text_repel(data = var_coords, 
+                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
+                  color = "black", fontface = "bold", size = 4) +
+  # Individual points & labels
+  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
+  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
+    
+  scale_colour_manual(
+    values = c(
+      "broadleaved" = "#41624D",
+      "conifer" = "#7798B9"
+    )
+  ) +
+    scale_shape_manual(
+    values = c(
+      "broadleaved" = 16,
+      "conifer" = 17
+    )
+  ) +
+theme_minimal() +
+labs(x = pc1_lab, y = pc2_lab) +
+# coord_cartesian(xlim = x_limits, ylim = y_limits) +
+coord_fixed() +
+theme(legend.position = "none")
+
+pca_traits_both
+
+
+# extract the scores
+pca_scores_one_pca <- ind_coords %>%
+  dplyr::select(species, PC1, PC2)
+
+```
+
+
+
+## 4.2. Fig. S12 - Stomata Density x Size
+
+```{r density size}
+
+# full dataset model
+mod_all <- lm(GCL ~ SD, data = data_mean)
+r2_all  <- summary(mod_all)$r.squared
+p_all   <- summary(mod_all)$coefficients[2, 4]
+
+# conifer-only model
+mod_con <- lm(GCL ~ SD, data = data_mean %>% filter(tree_group == "conifer"))
+r2_con  <- summary(mod_con)$r.squared
+p_con   <- summary(mod_con)$coefficients[2, 4]
+
+# just for having p < 0.001
+
+format_p <- function(p) {
+  if (p < 0.001) {
+    "p < 0.001"
+  } else if (p < 0.01) {
+    "p < 0.01"
+  } else if (p < 0.05) {
+    "p < 0.05"
+  } else {
+    "p ≥ 0.05"
+  }
+}
+
+p_all_txt <- format_p(p_all)
+p_con_txt <- format_p(p_con)
+
+
+# create labels
+lab_all <- paste0("R² = ", round(r2_all, 2),
+                  "\n", p_all_txt)
+
+lab_con <- paste0("R² = ", round(r2_con, 2),
+                  "\n", p_con_txt)
+
+# correlation between SD and GCL
+
+fig_SD_GCL_all <- 
+  data_mean %>%
+  ggplot(aes(x = SD, y = GCL)) +
+
+  # vertical SE (GCL)
+  geom_errorbar(
+    aes(ymin = GCL - GCL_se, 
+        ymax = GCL + GCL_se,
+        colour = tree_group),
+    width = 0,
+  alpha = 0.6,
+  linewidth = 0.4
+  ) +
+
+  # horizontal SE (SD) 
+  geom_errorbar(
+    aes(xmin = SD - SD_se, 
+        xmax = SD + SD_se,
+        colour=tree_group),
+    height = 0,
+    orientation = "y",
+  alpha = 0.6,
+  linewidth = 0.4
+  ) +
+
+  geom_point(aes(shape=tree_group, colour=tree_group), alpha=0.8, size = 4) +
+  
+  geom_smooth(method = "lm", se = FALSE, colour="darkgrey") +
+
+  scale_shape_manual(values = c("broadleaved" = 16, "conifer" = 17)) +
+  
+  scale_colour_manual(
+    values = c("broadleaved" = "#41624D", "conifer" = "#7798B9")
+) +
+annotate("text",
+         x = -Inf, y = -Inf,
+         label = lab_all,
+         hjust = -0.1, 
+         vjust = -0.5,
+         size = 4) +
+  theme_classic() +
+  labs(
+    x = "Stomatal density [N/mm²]",
+    y = "Guard cell length [µm]",
+    shape = "Tree Group",
+    colour = "Tree Group"
+  )
+fig_SD_GCL_all
+
+
+# inset for gymnosperms only
+fig_SD_GCL_conifers <- data_mean %>%
+  filter(tree_group == "conifer") %>%
+  ggplot(aes(x = SD, 
+             y = GCL)) +
+  geom_point(shape = 17, 
+             size = 3, 
+             alpha = 0.7,
+             colour="#7798B9") +
+  geom_smooth(method = "lm", se = FALSE, colour = "darkgrey") +
+  theme_classic() +
+  labs(x = NULL, y = NULL) +
+   annotate("text",
+           x = Inf, y = Inf,
+           label = lab_con,
+           hjust = 1.1, vjust = 1.5,
+           size = 3) +
+  theme(axis.text = element_text(size = 6),
+        axis.title = element_text(size = 7))
+
+
+# combine main plot + inset
+fig_SD_GCL <- fig_SD_GCL_all + 
+  inset_element(fig_SD_GCL_conifers, 
+                left = 0.55, 
+                bottom = 0.55, 
+                right = 0.98, 
+                top = 0.98)
+fig_SD_GCL
+
+ggsave(here("output", "Fig_S12_stom_dens_size.png"), fig_SD_GCL,  height=5, width=7, dpi=300)
+
+
+```
+
+
+
+# 5. Supplementary Tables
+## 5.1. Tab. S9 - Leaf trait model summary
+```{r leaf trait model results table}
+
+
+metrics <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+traits  <- c("SD_scaled", "GCL_scaled", "SLA_scaled", "LDMC_scaled", 
+             "thick_scaled", "tough_scaled", "leaf_N_area_scaled")
+
+summary_list_trait_models <- list()
+model_counter <- 1 # Initialize the 1 to 28 numbering counter
+
+for (m in metrics) {
+  for (t in traits) {
+    
+    # This matches the original file name where the model is stored
+    original_model_name <- paste0("model_", m, "_", t)
+    file_path <- here::here("output", "models", paste0(original_model_name, ".rds"))
+    
+    if (!file.exists(file_path)) next
+    
+    fit <- readRDS(file_path)
+    fit_summary <- summary(fit)$fixed
+    
+    # Calculate Bayes R2
+    r2_val <- bayes_R2(fit)[1, "Estimate"]
+    
+    ref_slope_row <- t
+    interaction_row <- grep(paste0("^", t, ":tree_group"), rownames(fit_summary), value = TRUE)
+    
+    # Clean up names for the table presentation
+    clean_metric <- gsub("_scaled", "", m)
+    clean_trait  <- gsub("_scaled", "", t)
+    display_model_name <- paste0("Model ", model_counter)
+    
+    # --- Group 1: Broadleaved (The Reference Group) ---
+    if (ref_slope_row %in% rownames(fit_summary)) {
+      g1_stats <- fit_summary[ref_slope_row, ]
+      
+      summary_list_trait_models[[length(summary_list_trait_models) + 1]] <- data.frame(
+        model_name = display_model_name,
+        metric     = clean_metric,
+        trait      = clean_trait,
+        tree_group = "broadleaved",
+        R2         = r2_val,
+        slope      = as.numeric(g1_stats["Estimate"]),
+        CI_lower   = as.numeric(g1_stats["l-95% CI"]),
+        CI_upper   = as.numeric(g1_stats["u-95% CI"]),
+        Rhat       = as.numeric(g1_stats["Rhat"]),
+        ESS_Bulk   = as.numeric(g1_stats["Bulk_ESS"]),
+        ESS_Tail   = as.numeric(g1_stats["Tail_ESS"]),
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    # --- Group 2: Conifers (The Interaction Group) ---
+    if (length(interaction_row) > 0 && interaction_row %in% rownames(fit_summary)) {
+      g2_diff  <- fit_summary[interaction_row, ]
+      
+      draws <- as.data.frame(fit)
+      b_ref <- draws[[paste0("b_", ref_slope_row)]]
+      b_int <- draws[[paste0("b_", interaction_row)]]
+      g2_slope_posterior <- b_ref + b_int
+      
+      summary_list_trait_models[[length(summary_list_trait_models) + 1]] <- data.frame(
+        model_name = display_model_name,
+        metric     = clean_metric,
+        trait      = clean_trait,
+        tree_group = "conifer",
+        R2         = r2_val,
+        slope      = mean(g2_slope_posterior),
+        CI_lower   = quantile(g2_slope_posterior, probs = 0.025),
+        CI_upper   = quantile(g2_slope_posterior, probs = 0.975),
+        Rhat       = as.numeric(g2_diff["Rhat"]),     
+        ESS_Bulk   = as.numeric(g2_diff["Bulk_ESS"]), 
+        ESS_Tail   = as.numeric(g2_diff["Tail_ESS"]), 
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    # Advance the counter for the next model combination
+    model_counter <- model_counter + 1
+  }
+}
+
+# Combine and apply rounding rules
+summary_table_trait_models <- 
+  bind_rows(summary_list_trait_models)  %>% 
+  mutate(
+    R2       = round(R2, 2),
+    slope    = round(slope, 3),
+    CI_lower = round(CI_lower, 2),
+    CI_upper = round(CI_upper, 2),
+    Rhat     = round(Rhat, 2),
+    ESS_Bulk = round(ESS_Bulk, 0),
+    ESS_Tail = round(ESS_Tail, 0)
+  )
+
+# Save files
+write_xlsx(summary_table_trait_models, here("output", "tables", "final", "Table_S9_model_summary_table_traits.xlsx"))
+
+```
+
+
+## 5.2. Tab. S10 - Leaf ∆δ13C model summary
+```{r Dd13C model results table}
+
+model_list_Dd13C <- list(
+  "gsmax"   = model_gs_max_delta_d13C_scaled,
+  "VPDopt"   = model_VPD_opt_delta_d13C_scaled,
+  "VPD50"    = model_VPD50_delta_d13C_scaled,
+  "Sclosure" = model_Sclosure_delta_d13C_scaled
+)
+
+group_levels <- levels(data_for_models$tree_group)
+broadleaved <- group_levels[1]
+conifer <- group_levels[2]
+
+extract_model_metrics_named <- function(model_name, model_obj, g1, g2) {
+  
+  sum_mod <- summary(model_obj)
+  fixed_eff <- as.data.frame(sum_mod$fixed)
+  
+  rhat_val <- fixed_eff["delta_d13C_scaled", "Rhat"]
+  bulk_ess <- fixed_eff["delta_d13C_scaled", "Bulk_ESS"]
+  tail_ess <- fixed_eff["delta_d13C_scaled", "Tail_ESS"]
+  r2_val   <- bayes_R2(model_obj)[1, "Estimate"]
+  
+  # Calculate Slopes
+  hyp_lvl1 <- hypothesis(model_obj, "delta_d13C_scaled = 0")
+  
+  int_term <- rownames(fixed_eff)[grep("delta_d13C_scaled:", rownames(fixed_eff))]
+  hyp_formula_lvl2 <- paste("delta_d13C_scaled +", int_term, "= 0")
+  hyp_lvl2 <- hypothesis(model_obj, hyp_formula_lvl2)
+  
+  predictor_metric <- str_remove(model_name, "model_Dd13C_")
+  
+  # Build the tibble row
+  res <- tibble(
+    Model_Name   = model_name,
+    Response     = "Dd13C",
+    Predictor    = predictor_metric,
+    Rhat         = round(rhat_val, 3),
+    ESS_Bulk     = round(bulk_ess, 0),
+    ESS_Tail     = round(tail_ess, 0),
+    
+    # Dynamic slope columns using your group names
+    !!paste0("Slope_", g1) := round(hyp_lvl1$hypothesis$Estimate, 3),
+    !!paste0("CI_", g1)    := paste0("[", round(hyp_lvl1$hypothesis$CI.Lower, 3), ", ", round(hyp_lvl1$hypothesis$CI.Upper, 3), "]"),
+    
+    !!paste0("Slope_", g2) := round(hyp_lvl2$hypothesis$Estimate, 3),
+    !!paste0("CI_", g2)    := paste0("[", round(hyp_lvl2$hypothesis$CI.Lower, 3), ", ", round(hyp_lvl2$hypothesis$CI.Upper, 3), "]"),
+    
+    Bayes_R2     = round(r2_val, 3)
+  )
+  
+  return(res)
+}
+
+# 3. Run the loop across your model list
+summary_table_Dd13C <- imap_dfr(model_list_Dd13C, ~extract_model_metrics_named(.y, .x, broadleaved, conifer))
+
+write_xlsx(summary_table_Dd13C, here("output", "Table_S10_model_summary_table_Dd13C.xlsx"))
+
+
+```
+
+
+
+# 6. Additional Analysis with PCA scores
+## 6.1. Model
+```{r pca score analysis}
+
+# 1. one PCA for all
+data_for_models <- data_for_models %>% left_join(pca_scores_one_pca)
+
+# use the function from above and just now the PC scores
+
+run_metric_models(
+  metrics = c("gs_max", "VPD_opt", "VPD50", "Sclosure"),
+  predictors = c("PC1", "PC2"),
+  df = data_for_models
+)
+
+
+# 2. now the same with the separate PCAs
+pca_scores_separate <- pca_scores_separate %>% rename(PC1sep = PC1,
+                                                      PC2sep = PC2)
+# two separate PCAs
+data_for_models <- data_for_models %>% left_join(pca_scores_separate)
+
+# use the function from above and just now the PC scores
+
+run_metric_models(
+  metrics = c("gs_max", "VPD_opt", "VPD50", "Sclosure"),
+  predictors = c("PC1sep", "PC2sep"),
+  df = data_for_models
+)
+
+
+
+
+```
+## 6.2. Results figure - effect size
+```{r pca model results figure}
+
+metrics <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+traits  <- c("PC1sep", "PC2sep")
+
+summary_list_trait_models <- list()
+model_counter <- 1
+
+for (m in metrics) {
+  for (t in traits) {
+    
+    original_model_name <- paste0("model_", m, "_", t)
+    file_path <- here::here("output", "models", paste0(original_model_name, ".rds"))
+    
+    if (!file.exists(file_path)) next
+    
+    fit <- readRDS(file_path)
+    
+    trait_scale_col <- t
+    
+    # Calculate Bayes R2
+    r2_val <- bayes_R2(fit)[1, "Estimate"]
+    
+    clean_metric <- gsub("_scaled", "", m)
+    clean_trait  <- gsub("_scaled", "", t)
+    display_model_name <- paste0("Model ", model_counter)
+    
+    # Extract slopes via emtrends — same as your single panel figures
+    trends <- tryCatch(
+      as.data.frame(emtrends(fit, ~ tree_group, var = trait_scale_col)),
+      error = function(e) { warning(paste("emtrends failed for", original_model_name)); return(NULL) }
+    )
+    
+    if (is.null(trends)) next
+    
+    colnames(trends)[colnames(trends) == paste0(trait_scale_col, ".trend")] <- "trend"
+    
+ for (grp in c("broadleaved", "conifer")) {
+  
+  # Get full posterior draws for this group's slope
+  slope_draws <- fit %>% 
+    emtrends(~ tree_group, var = trait_scale_col) %>%
+    gather_emmeans_draws() %>%
+    filter(tree_group == grp) %>%
+    rename(slope = .value)
+  
+  if (nrow(slope_draws) == 0) next
+  
+  # Summarise with 95% credible interval
+  grp_summary <- slope_draws %>%
+    tidybayes::median_qi(slope, .width = 0.95)
+  
+  summary_list_trait_models[[length(summary_list_trait_models) + 1]] <- data.frame(
+    model_name = display_model_name,
+    metric     = clean_metric,
+    trait      = clean_trait,
+    tree_group = grp,
+    R2         = r2_val,
+    slope      = grp_summary$slope,
+    CI_lower   = grp_summary$.lower,
+    CI_upper   = grp_summary$.upper,
+    stringsAsFactors = FALSE
+  )
+}
+    
+    model_counter <- model_counter + 1
+  }
+}
+
+
+
+# Combine and apply rounding rules
+ 
+summary_table_trait_models <- 
+  bind_rows(summary_list_trait_models) %>% 
+  mutate(
+    R2       = round(R2, 2),
+    slope    = round(slope, 3),
+    CI_lower = round(CI_lower, 2),
+    CI_upper = round(CI_upper, 2)
+  )
+
+
+# Named vector for nice trait labels
+trait_labels <- c(
+  "PC1sep"          = "LES",
+  "PC2sep"         = "Stomatal Anatomy"
+)
+
+# Custom labeller for metrics using plotmath expressions
+metric_labeller <- as_labeller(
+  c(
+    "gs_max"  = "g[max]",
+    "VPD_opt"  = "VPD[opt]",
+    "VPD50"     = "VPD[50]",
+    "Sclosure"  = "S[closure]"
+  ),
+  default = label_parsed   # tells ggplot to parse as plotmath
+)
+
+
+
+correct_trait_levels  <- c("PC1sep", "PC2sep")
+correct_metric_levels <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+
+plot_data <- summary_table_trait_models %>%
+  mutate(
+    tree_group = factor(tree_group, levels = c("conifer", "broadleaved")),
+    trait      = factor(trait,  levels = correct_trait_levels),
+    metric     = factor(metric, levels = correct_metric_levels)
+  )
+
+highlight_panels <- summary_table_trait_models %>%
+  group_by(metric, trait) %>%
+  summarise(highlight = any(CI_lower > 0 | CI_upper < 0), .groups = "drop") %>%
+  filter(highlight) %>%
+  mutate(
+    trait  = factor(trait,  levels = correct_trait_levels),
+    metric = factor(metric, levels = correct_metric_levels)
+  )
+
+
+
+pca_effect_plot <- 
+  ggplot(plot_data, aes(x = slope, y = tree_group, color = tree_group, shape = tree_group)) +
+  
+    # Background highlight for panels with at least one credible effect
+  geom_rect(
+    data = highlight_panels,
+    aes(fill = highlight),
+    xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf,
+    inherit.aes = FALSE,
+    fill = "grey92", color = NA
+  ) +
+  
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  geom_pointrange(aes(xmin = CI_lower, xmax = CI_upper), size = 0.6) +
+  
+  facet_grid(
+    rows  = vars(trait),
+    cols  = vars(metric),
+    scales = "free_x",
+    switch = "y",                          # moves row strips to the LEFT
+    labeller = labeller(
+      trait  = trait_labels,              # plain text names
+      metric = metric_labeller            # parsed plotmath for subscripts
+    )
+  ) +
+  
+  scale_color_manual(
+    values = c("broadleaved" = "#41624D", "conifer" = "#7798B9"),
+    labels = c("broadleaved" = "Broadleaved", "conifer" = "Conifer")
+  ) +
+  scale_shape_manual(
+    values = c("broadleaved" = 16, "conifer" = 17),
+    labels = c("broadleaved" = "Broadleaved", "conifer" = "Conifer")
+  ) +
+  
+  labs(
+    x     = "Standardized slope estimate (95% credible interval)",
+    y     = NULL,
+    color = NULL,
+    shape = NULL
+  ) +
+  
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background  = element_blank(),
+    strip.placement  = "outside",                        
+    strip.text.x      = element_text(face = "bold", size = 13),
+    strip.text.y.left = element_text(angle = 0, face = "bold", hjust = 1, size = 11),
+    panel.grid.minor = element_blank(),
+    panel.grid.major   = element_blank(),
+    legend.position  = "bottom",
+    axis.text.y      = element_blank(),
+    axis.ticks.y     = element_blank()
+  )
+
+pca_effect_plot
+```

@@ -1,0 +1,337 @@
+---
+title: "Stomatal Behaviour 2026 - 01 Data Cleaning Script"
+author: "Lena Sachsenmaier"
+output:
+  html_document:
+    df_print: paged
+contact: lena.sachsenmaier.research@gmail.com.de
+update: "2026-07-30"
+updated: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+
+Loading packages needed
+
+```{r setup}
+
+library(tidyverse) # basic data manipulation
+library(lubridate) # for wrangling with dates and times
+library(here) # reproducible file paths
+
+```
+
+
+### 1. Load the data frame
+
+```{r load data}
+
+data <- read_csv(here("data", "raw", "data_stomatal_conductance.csv"))
+
+```
+
+
+### 2. Drivers sanity check
+
+based on the equations in the manual certain things must be excluded:
+* any value that is lower than VPD = 0.05 kPa
+* any value that is higher than RH = 95 %
+```{r drivers sanity check}
+
+sanity_check_VPD <- data %>% 
+  filter(VPDleaf < 0.05)
+# result: all values are fine!
+
+sanity_check_RH <- data %>% 
+  filter(rh_s > 95 | rh_r > 95)
+# result: all values are fine!
+
+
+# delete dataframes, not needed anymore
+rm(sanity_check_RH, sanity_check_VPD)
+
+```
+
+
+### 3. Correction of light measurements (via dummy flag)
+
+During the campaign it could have happened, that we measured gsw, but the light sensor
+was blocked or shadowed, i.e. the light measurement is not reliable to the corresponding gsw.
+In such cases people were told to measure directly afterwards again so that the light sensor is not 
+blocked, but gsw is not reliable and flag this value as "dummy_light" in the device's remarks.
+For all those values that are flagged with "dummy_light" we need to replace the Qamb value of the measurement
+before (same tree, same leaf, same time range) and delete the dummy Qamb values afterwards.
+
+
+```{r dummy light}
+
+# Dummy light measurements contain a reliable Qamb value measured
+# immediately after the original measurement on the same leaf.
+# They are used to replace Qamb values when the light sensor
+# was temporarily blocked.
+data_dummylight <- data %>%
+  arrange(date_time) %>%
+  # Round all times to nearest 10 minutes
+  mutate(nearest_time = round_date(date_time, unit = "10 mins"))
+
+dummy <- data_dummylight %>%
+  filter(remarks_device == "dummy_light") %>% 
+  mutate(Qamb_dummy = Qamb) %>% 
+  # only keep what we need, so that gsw cannot be used of this dataset, its invalid!
+  dplyr::select(c(species, tree_id, leaf_nr, nearest_time, Qamb_dummy))
+
+data_with_dummy_qamb <- data_dummylight %>% 
+  left_join(dummy, by=c("species", "tree_id", "leaf_nr", "nearest_time"))
+
+# delete dummry data frame, not needed anymore
+rm(dummy)
+
+# replace Qamb where dummy exists and mark the source
+data_qamb <- data_with_dummy_qamb %>%
+  mutate(
+    # use Qamb_dummy when it exists, otherwise keep Qamb
+    Qamb = coalesce(Qamb_dummy, Qamb), 
+    Qamb_source = if_else(!is.na(Qamb_dummy), "dummy", "original")
+  ) %>%
+  filter(is.na(remarks_device) | remarks_device != "dummy_light") %>%
+  dplyr::select(-Qamb_dummy)
+
+
+```
+
+
+### 4. Exclusion of immediate double-measurements
+
+Sometimes it might have occurred, that people were surprised by a measurement value 
+(unusually high, or unusually low) and directly measured this leaf again, to be sure.
+When they inputted the right leaf number again, but did not specify the first value 
+as to-be-deleted, the wrong one is still in. But in such cases the value should not 
+stay in double, but we only want to keep the second measurement value.
+So in short:
+If the same leaf was measured twice within a short time window, 
+we assume the first measurement was erroneous and only the second measurement is retained.
+We define a time threshold of 5 minutes. We removed 10 erroneous measurements with that:
+
+```{r exclude immediate double values}
+
+data_no_repeats <- data_qamb %>%
+  arrange(species, tree_id, leaf_nr, date_time) %>%
+  group_by(species, tree_id, leaf_nr) %>%
+  mutate(
+    time_diff = as.numeric(difftime(date_time, lag(date_time), units = "mins")),
+    immediate_repeat = !is.na(time_diff) & time_diff <= 5
+  ) %>% 
+  mutate(
+    followed_by_repeat = lead(immediate_repeat, default = FALSE)
+  ) %>%
+  filter(!followed_by_repeat) %>%
+  ungroup()
+
+# We removed 10 measurements
+
+```
+
+
+### 5. Chamber leakage quality control
+
+All values with very high leakage are not reliable! 
+In the needle porometer (LI-600N, LICOR) it's normal to have quite high leakage,
+because the needle is going through the chamber and the gaskets cannot always close perfectly.
+We set the threshold value to 20 % leakage for conifers (LI-600N, LICOR), 
+and to 15 % leakage for broadleaveds (LI-600, LICOR) and every value with higher leakage gets excluded.
+
+```{r leakage, fig.height=2, fig_width=3}
+
+# Inspect leakage distributions separately for broadleaveds and conifers
+# to evaluate appropriate quality-control thresholds.
+data_no_repeats %>% 
+  ggplot() + 
+  geom_histogram(aes(leak_pct)) + 
+  facet_wrap(~tree_group, scales = "free_y")
+
+# Quantify the consequences of alternative leakage thresholds on data retention
+data_no_repeats %>%
+  group_by(tree_group) %>%
+  summarise(
+    pct_over_10 = mean(leak_pct > 10, na.rm = TRUE) * 100,
+    pct_over_15 = mean(leak_pct > 15, na.rm = TRUE) * 100,
+    pct_over_20 = mean(leak_pct > 20, na.rm = TRUE) * 100,
+    n = n(),
+    .groups = "drop"
+  )
+
+
+# check, how many values have high leakage with the given leakage percentages (15 % for angio, 20 % for gymno)
+# and how many leaves would remain, when we have to take out the high leakage values
+leak_overview <- data_no_repeats %>%
+  mutate(leak_flag = case_when(tree_group == "broadleaved" & leak_pct > 15 ~ TRUE,
+                               tree_group == "conifer" & leak_pct > 20 ~ TRUE,
+                               TRUE ~ FALSE)) %>%
+  group_by(species, tree_id, leaf_nr) %>%
+  summarise(
+    n_total = n(),
+    n_high_leak = sum(leak_flag, na.rm = TRUE),
+    n_remaining = n_total - n_high_leak,
+    below_5_after = n_remaining < 5,
+    below_6_after = n_remaining < 6,
+    below_7_after = n_remaining < 7,
+    .groups = "drop"
+  )
+
+
+#  check how many leaves would remain per species
+leak_overview_sp <- leak_overview %>%
+  group_by(species) %>%
+  summarise(
+    n_leaves_total = n(),
+    n_leaves_below_5 = sum(below_5_after),
+    n_leaves_below_6 = sum(below_6_after),
+    n_leaves_below_7 = sum(below_7_after),
+    pct_leaves_below_5 = 100 * mean(below_5_after),
+    mean_meas_before = mean(n_total),
+    mean_meas_after = mean(n_remaining),
+    .groups = "drop"
+  )
+
+# only keep the leaves that have more minimum 5 measurements per leaf
+# (because otherwise it would be difficult to fit a leaf-level curve into these few points)
+leaves_to_exclude_leak <- leak_overview %>%
+  filter(n_remaining < 5) %>%
+  dplyr::select(species, tree_id, leaf_nr)
+# result: we need to exclude 7 leaves completely from the data.
+
+# Exclude those 7 leaves:
+data_cleaned_leak <- data_no_repeats %>%
+  anti_join(leaves_to_exclude_leak,
+            by = c("species", "tree_id", "leaf_nr"))
+
+
+```
+
+### 6. Physiologically unreliable measurements
+
+Any measurement of stomatal conductance (gsw) < 0, can physically not be true and is a measurement error.
+However, sometimes it can be just due to the degree of measurement precision, 
+that leads to negative gsw, in case gsw is close to zero.
+
+These data can be converted to 0 if it is certain they are occurring due to low conductance 
+(i.e., it’s around midday/there’s light yet the PhiPS2 and the Etr measured by the fluorometer are negative). 
+Even in those cases where it indeed looks like they are due to low conductance, 
+only pass them to 0 if the leakage rate is very low (e.g., <5%).
+
+Otherwise, if there is no definite indication that they are due to a low gs, remove them entirely -- 
+the reason is, that you could get a negative read for an actually high gs if the measurement of the flow rates fails. 
+For example, a co—occurring negative gsw with positive PhiPS2 and positive Etr are not 
+physiologically possible yet do not indicate a very low gsw either – so we decided to remove these data.
+
+
+```{r negative gsw}
+
+# Negative stomatal conductance values indicate either
+# measurement uncertainty around zero or instrument failure.
+# Quantify their frequency before applying the filtering rules.
+data_cleaned_leak %>%
+  summarise(n_negative_gsw = sum(gsw < 0))
+# result: 71 observations have gsw < 0
+
+# neg_gsw_sp <- data_cleaned_leak %>% filter(gsw<0) %>% group_by(species, tree_id, leaf_nr) %>% summarize(n=n())
+
+# check, whether are there any species-specific patterns in negative gsw:
+data_cleaned_leak %>% 
+  filter(gsw<0) %>% 
+  count(species)
+
+
+# filter the unreliable values out:
+data_cleaned_physiological <- 
+  data_cleaned_leak %>% 
+  mutate(
+    reliability = case_when(
+      tree_group == "broadleaved" & gsw<0 & leak_pct>5 ~ "unreliable",
+      tree_group == "conifer" & gsw<0 & leak_pct>10 ~ "unreliable",
+      gsw<0 & PhiPS2<0 & ETR<0 & Qamb>50 ~ "zero",
+      # in those cases where it indeed looks like they are due to low conductance, we only pass them to 0 if the leakage rate is very low (<5%).
+      tree_group == "broadleaved" & gsw<0 & leak_pct<5 ~ "zero",
+      tree_group == "conifer" & gsw<0 & leak_pct<10 ~ "zero",
+      gsw>= 0 ~ "reliable",
+      TRUE ~ NA_character_
+    )) %>% 
+      # remove the ones that are not reliable
+  filter(reliability!="unreliable") %>% 
+      # convert the ones to zero that might be real measurements, but are just negative due to the device inaccuracy
+  mutate(
+      gsw = case_when(reliability=="zero" ~ 0,
+                      reliability=="reliable" ~ gsw,
+                      TRUE ~ gsw)
+      )
+
+# check what changed, with a summary table
+data_cleaned_physiological %>% 
+  group_by(tree_group, reliability) %>% 
+  summarize(
+    `Count` = n(),
+    .groups = "drop"
+  )
+
+```
+
+
+
+### 7. Exclusion of leaves with less than 5 data points
+
+```{r quick test how many measurement we have per tree}
+
+leaves_with_too_little_data <- 
+  data_cleaned_physiological %>% 
+  group_by(tree_id, date, leaf_nr) %>% 
+  summarize(datapoints_per_leaf = n(), .groups="drop") %>% 
+  filter(datapoints_per_leaf < 5) %>%
+  dplyr::select(tree_id, date, leaf_nr)
+
+# exclude the leaves that have now too little data points (below 5)
+data_final <- 
+  data_cleaned_physiological %>%
+  anti_join(leaves_with_too_little_data,
+            by = c("tree_id", "date", "leaf_nr"))
+# 16 measurements are excluded with this step
+
+```
+
+
+### 8. Summary of the final data
+```{r check of the final dataframe}
+
+# Measurements per tree
+tree_summary <- data_final %>%
+  group_by(species, tree_id) %>%
+  summarise(
+    measurements = n(),
+    leaves = n_distinct(leaf_nr),
+    .groups = "drop"
+  )
+
+# Species-level overview
+final_dataset_summary <- 
+  tree_summary %>%
+  group_by(species) %>%
+  summarise(
+    trees = n(),
+    measurements_per_tree_min = min(measurements),
+    measurements_per_tree_max = max(measurements),
+    measurements = sum(measurements),
+    leaves_per_tree_min = min(leaves),
+    leaves_per_tree_max = max(leaves),
+    leaves = sum(leaves),
+    .groups = "drop"
+  )
+
+final_dataset_summary
+
+```
+
+### 9. Export of the final data
+
+```{r write the dataframe}
+
+write_csv(data_final, here("data", "processed", "data_cleaned.csv"))
+
+```

@@ -1,0 +1,152 @@
+---
+title: "Stomatal Behaviour 2026 - 01 Data Cleaning Script"
+author: "Lena Sachsenmaier"
+output:
+  html_document:
+    df_print: paged
+contact: lena.sachsenmaier.research@gmail.com.de
+created: "2026-07-30"
+updated: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+
+```{r setup}
+library(here)
+library(tidyverse)
+
+```
+
+
+
+# 1. Create folder structure
+
+```{r create the folder structure needed}
+
+dir.create("data/raw", recursive = TRUE)
+dir.create("data/processed", recursive = TRUE)
+
+dir.create("output/models", recursive = TRUE)
+dir.create("output/figures", recursive = TRUE)
+dir.create("output/tables", recursive = TRUE)
+
+
+```
+
+
+# 2. Data download
+## 2.1. Stomatal conductance (& associated climate station data)
+
+Primary data are currently restricted during peer review. Will be made publicly available upon acceptance of the manuscript.
+
+```{r download main data set + climate station data}
+
+data <- here(
+  "data", "raw",
+  "DATA_01_stomatal_conductance.csv"
+)
+
+climate_data <- here(
+  "data", "raw",
+  "DATA_02_climate_station_data_ARBOfun_2024.csv"
+)
+
+if (!file.exists(data)) {
+  message(
+    "The primary data are currently restricted during peer review. ",
+    "If you are a reviewer of this manuscript, please use the data access link ",
+    "provided by the editor to download the dataset and place it in ",
+    "'data/raw/' before proceeding."
+  )
+}
+if (!file.exists(climate_data)) {
+  message(
+    "The primary data are currently restricted during peer review. ",
+    "If you are a reviewer of this manuscript, please use the data access link ",
+    "provided by the editor to download the dataset and place it in ",
+    "'data/raw/' before proceeding."
+  )
+}
+
+
+```
+
+## 2.2. Leaf carbon isotope data
+
+Kahl, A., Schnabel, F., Richter, R., Olbrich, J., Zahner, G., Weigelt, A., & Wirth, C. (2026). 
+Leaf δ¹³C of 38 tree species measured in 2018 and 2021 (ARBOfun research arboretum, Germany) 
+[Dataset]. Zenodo. https://doi.org/10.5281/zenodo.22284412
+
+Primary data are currently restricted during peer review. Will be made publicly available upon acceptance of the manuscript.
+
+```{r download d13C data}
+
+delta_d13C_species_means <- here(
+  "data", "raw",
+  "DATA_leaf_d13C_2018_2021_ARBOfun.csv"
+)
+
+
+if (!file.exists(delta_d13C_species_means)) {
+  message(
+    "The leaf d13C data are currently restricted during peer review. ",
+    "If you are a reviewer of this manuscript, please use the data access link ",
+    "provided by the editor to download the dataset and place it in ",
+    "'data/raw/' before proceeding."
+  )
+}
+
+
+```
+
+## 2.3. Stomatal anatomy traits
+
+Kretz, L., Sachsenmaier, L., von Sivers, L., Nabel, N., Wirth, C., & Weigelt, A. (2026). 
+Stomatal density and size of 27 angiosperm tree species (ARBOfun research arboretum, Germany) 
+(Version 1.0.0) [Dataset]. Zenodo. https://doi.org/10.5281/zenodo.22117766
+
+Sachsenmaier, L., Franz, S., Kahl, A., Kretz, L., & Wirth, C. (2026). 
+Stomatal density and size of 12 conifer tree species (1.0.0) 
+[Data set]. Zenodo. https://doi.org/10.5281/zenodo.21098915
+
+
+```{r download stomata anatomy traits}
+
+# Angiosperm stomatal trait data
+download.file(
+  url = "https://zenodo.org/records/22117766/files/DATA_stomatal_density_size_angiosperm_tree_species_ARBOfun.csv?download=1",
+  destfile = here(
+    "data", "raw",
+    "Kretz_Sachsenmaier_et_al_2026_angiosperm_stomatal_trait_data.csv"
+  ),
+  mode = "wb"
+)
+
+
+# Gymnosperm stomatal trait data
+download.file(
+  url = "https://zenodo.org/records/21098915/files/Sachsenmaier_et_al_2026_conifer_stomatal_trait_data.csv?download=1",
+  destfile = here(
+    "data", "raw",
+    "Sachsenmaier_et_al_2026_conifer_stomatal_trait_data.csv"
+  ),
+  mode = "wb"
+)
+
+```
+
+## 2.4. Leaf economic traits
+
+Please note, the data is currently under review at Zenodo, but should be publicly available soon via this DOI:
+
+10.5281/zenodo.21821305 
+
+Please download it and put it into the raw data folder.
+
+```{r downlaod leaf economic traits}
+
+leaf_traits_data_location <- "https://doi.org/10.5281/zenodo.21821305"
+
+
+```
+
+

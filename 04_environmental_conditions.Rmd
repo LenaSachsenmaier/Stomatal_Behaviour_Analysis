@@ -1,0 +1,936 @@
+---
+title: "Stomatal Behaviour 2026 - 04 Environmental Conditions"
+author: "Lena Sachsenmaier"
+output:
+  html_document:
+    df_print: paged
+contact: lena.sachsenmaier@idiv.de
+update: "2026-07-27"
+updated: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+**updated by**: Lena Sachsenmaier
+**Contact**: lena.sachsenmaier@idiv.de  
+**Last updated**: `r format(Sys.time(), '%d %B, %Y')`
+
+
+Loading the packages needed:
+
+```{r setup, warning=F}
+
+library(tidyverse)    # data manipulation and visualisation
+library(here)         # project-relative file paths
+library(RColorBrewer) # colour palettes for figures
+library(ggpubr)       # arranging multiple ggplots
+library(patchwork)    # combining ggplots
+library(lme4)         # linear mixed-effects models
+library(emmeans)      # estimated marginal means and trends
+library(lubridate)    # working with dates and times
+library(SPEI)         # SPEI drought index and PET calculations
+library(soilDB)       # Rosetta pedotransfer model
+
+Sys.setlocale("LC_TIME", "C")  # use English month and weekday names
+
+```
+
+
+# 1. SPEI - Drought Index
+
+SPEI is the standardized precipitation evapotranspiration index, a commonly used drought index.
+(for more information, see Vicente-Serrano et al., 2010 https://doi.org/10.1175/2009JCLI2909.1)
+
+We use it here to identify which years have been drought years at our site.
+
+For the calculation of the SPEI, the R package spei() is used. See Vignette here: https://cran.r-project.org/web/packages/SPEI/SPEI.pdf 
+
+## 1.1. Preparation of data frame
+
+Automatized download the data from the German Meteorological Service - DWD (Deutscher Wetterdienst):
+for the climate station Leipzig/Halle Airport (Station ID: 02932) and cleaning it.
+
+
+```{r load the DWD data}
+
+# 1. Set up paths and station info
+station_id <- "02932"  # Leipzig/Halle
+base_url <- "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/historical/"
+data_dir <- "data"
+zip_path <- file.path(data_dir, paste0("climate_", station_id, ".zip"))
+
+if (!dir.exists(data_dir)) dir.create(data_dir)
+
+# 2. Get the directory listing and find the correct zip file name
+# (the file name includes the date range, which changes as DWD updates it,
+# so we can't hardcode it -- we scrape the index page instead)
+index_page <- read_lines(base_url)
+zip_filename <- str_subset(index_page, paste0("tageswerte_KL_", station_id, "_.*_hist\\.zip")) %>%
+  str_extract(paste0("tageswerte_KL_", station_id, "_[0-9]+_[0-9]+_hist\\.zip")) %>%
+  unique() %>%
+  na.omit() %>% 
+  .[1]
+
+file_url <- paste0(base_url, zip_filename)
+
+# 3. Download the zip file (only if not already downloaded)
+if (!file.exists(zip_path)) {
+  download.file(file_url, destfile = zip_path, mode = "wb")
+}
+
+# 4. Unzip into the data folder
+unzip(zip_path, exdir = data_dir)
+
+# 5. Find and read the actual product file (name starts with "produkt_klima_tag_")
+climate_file <- list.files(data_dir, pattern = "^produkt_klima_tag_.*\\.txt$", full.names = TRUE)[1]
+data_2932 <- read_delim(climate_file)
+
+glimpse(data_2932)
+
+
+# clean and prepare the dataframe
+climate <- data_2932 %>%
+  rename(
+    date = MESS_DATUM,
+    # wind
+    wind_gust_max = `  FX`,   # max wind speed (m/s)
+    wind_speed = `  FM`,      # mean wind speed (m/s)
+    
+    # precipitation
+    precipitation = ` RSK`,   # daily precipitation (mm)
+    precip_type = RSKF,       # precipitation type (code)
+    
+    # radiation / sunshine
+    sunshine_hours = ` SDK`,  # sunshine duration (h)
+    
+    # cloudiness
+    cloud_cover = `  NM`,     # cloud cover (1/8)
+    
+    # pressure & humidity
+    vapour_pressure = ` VPM`, # vapor pressure (hPa)
+    air_pressure = `  PM`,    # air pressure (hPa)
+    rel_humidity = ` UPM`,    # relative humidity (%)
+    
+    # temperature
+    t_mean = ` TMK`,          # daily mean temperature (°C)
+    t_min = ` TNK`,           # daily min 2m temp (°C)
+    t_max = ` TXK`,           # daily max 2m temp (°C)
+    t_ground_min = ` TGK`,    # min temp at 5cm (°C)
+    
+    # snow
+    snow_depth = SHK_TAG      # snow height (cm)
+  ) %>%
+  # convert numeric columns from character to numeric
+  mutate(across(c(wind_gust_max, wind_speed, precipitation, sunshine_hours,
+                  cloud_cover, vapour_pressure, air_pressure, rel_humidity,
+                  t_mean, t_min, t_max, t_ground_min, snow_depth), 
+                ~ as.numeric(trimws(.)))) %>% 
+  # convert cloud cover in okta (1/8) to percent (%): cc % = (cc/8)*100
+  mutate(cloud_cover = (cloud_cover/8)*100) %>% 
+  # convert air pressure and vapor pressure from hPa to kPa: p(kPa) = p(hPa)*0.1
+  mutate(air_pressure = air_pressure*0.1,
+         vapour_pressure = vapour_pressure*0.1) %>% 
+  mutate(date= ymd(date),
+         year= year(date), # create new variable: extract year
+         month=month(date)) %>% # create new variable: extract month
+  filter(year>=1973) %>%  # exclude everything before 1973, because data not complete
+  filter(year < 2026) %>%  # only until year 2025, because 2026 not yet complete
+  arrange(date) %>% 
+  relocate(year, .after=date) %>% 
+  relocate(month, .after=year)
+
+
+
+# First convert all "-999" (or strings of -999) to NA
+climate <- climate %>%
+  mutate(across(where(is.numeric), ~na_if(., -999)))  # replace -999 with NA
+
+# check for NA values in different all my variables  
+na_count <-sapply(climate, function(y) sum(length(which(is.na(y)))))
+na_count <- data.frame(na_count)
+na_count
+
+```
+
+
+## 1.2. Long-term means
+
+```{r long-term means}
+
+# What is the mean temperature between 1973 and 2025
+climate %>% dplyr::summarize(t_mean = mean(t_mean)) # 9.7 ° C
+
+# What is the mean annual precipitation between 1973 and 2025
+climate %>% 
+  group_by(year) %>% 
+  summarize(annual_precip = sum(precipitation)) %>% 
+  summarize(mean_annual_precip = mean(annual_precip))
+            # 519.52 mm per year
+
+```
+
+
+## 1.3. Calculation of monthly means
+```{r monthly means calculation}
+
+# mothly means
+monthly_climate <- climate %>%
+  group_by(year, month) %>%
+  summarise(
+    # sum precipitation
+    precipitation = sum(precipitation, na.rm = TRUE),
+    
+    # mean of all other numeric variables except precipitation
+    across(c(t_mean, t_min, t_max, wind_gust_max, wind_speed, sunshine_hours, snow_depth, 
+             cloud_cover, vapour_pressure, air_pressure, rel_humidity), 
+           ~mean(.x, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+```
+
+## 1.4. Site latitude and longitude
+```{r lat and long}
+# latitude and longitude of the climate station Leipzig/Halle Airport in Germany
+lat_station <- 51.43479
+elevation_station <- 131.0 
+
+```
+
+## 1.5. Calculation of PET
+
+Potential evapotranspirtation (PET) is the amount of evaporation and transpiration that would occur if a sufficient water source were available.  
+There are three different ways how to calculate PET:  
+
+* thornthwaite(Tave, lat, na.rm = FALSE, verbose=TRUE)
+* hargreaves(Tmin, Tmax, Ra = NULL, lat = NULL, Pre = NULL, na.rm = FALSE,
+verbose=TRUE)
+* penman(Tmin, Tmax, U2, Ra = NULL, lat = NULL, Rs = NULL, tsun = NULL,
+CC = NULL, ed = NULL, Tdew = NULL, RH = NULL, P = NULL, P0 = NULL,
+CO2 = NULL, z = NULL, crop='short', na.rm = FALSE, method='ICID',
+verbose=TRUE)
+
+* thornthwaite computes the monthly potential evapotranspiration (PE) according to the Thornth-
+waite (1948) equation. It is the simplest of the three methods, and can be used when only mean
+temperature data are available. But we have more available.
+* hargreaves computes the monthly reference evapotranspiration (ETo) of a grass crop based on
+the original Hargreaves equation (1994). However, if precipitation data Pre is provided a modified
+form due to Droogers and Allen (2002) will be used; this equation corrects ETo using the amount
+of rain of each month as a proxy for irradiation The Hargreaves method requires data on the mean
+external radiation, Ra. If Ra is not available it can be estimated from the latitude lat and the month
+of the year.
+* penman calculates the monthly reference evapotranspiration (ETo) of a hypothetical reference crop
+according to the Penman-Monteith equation (Monteith, 1965). This is widely considered the most
+accurate method for estimating ETo, and is the method recommended by the UN Food and Agricul-
+ture Organization (FAO). There are several methods which simplify the original Penman-Monteith
+equation and are used in practice. Here we follow by default the procedure described in Allen et al.
+(1994), aka the ‘ICID‘ method. However, other versions are also implemented and can be used by
+setting the method parameter to the appropriate value. The FAO-56 method (Allen et al., 1998) can
+be used by setting method to ‘FAO‘, while the variation of the American Society of Civil Engineers
+(Walter et al., 2002 is used when setting it to ‘ASCE‘. By default the original parameterization
+corresponding to a short reference crop of 0.12 m height is used, although the parameterization for
+a tall reference crop of 0.5 m height (Walter et al. (2002) can also be used, by setting the crop pa-
+rameter to ’tall’. The method requires data on the incoming solar radiation, Rs; since this is seldom
+available, the code will estimate it from data on the bright sunshine duration tsun, or alternatively
+from data on the percent cloud cover CC. Similarly, if data on the saturation water pressure ed are not
+available, it is possible to estimate it from the dew point temperature Tdew, from the relative humid-
+ity RH or even from the minimum temperature Tmin (sorted from least to most uncertain method).
+Similarly, the atmospheric surface pressure P required for computing the psychrometric constant
+can be calculated from the atmospheric pressure at sea level P0 and the elevation z, or else it will
+be assumed to be constant (101.3 kPa). If no wind speed data U2 are available, a constant value of 2
+m per second is used. Custom CO2 atmospheric concentration CO2 can also be provided, following
+Yang et al. (2019).  
+
+First all three PETs are calculated, but further we proceed with the PET_penman, because it is the most accurate one and we have all the data for it.
+
+```{r evapotranspiration}
+
+## Calculation of potential evapotranpiration  
+
+sapply(monthly_climate, function(x) sum(is.na(x)))
+
+monthly_climate <- monthly_climate %>%
+  mutate(PET_penman = penman(Tmin = t_min, 
+                             Tmax = t_max, 
+                             U2 = wind_speed, 
+                             CC = cloud_cover, 
+                             lat = lat_station, 
+                             z = elevation_station, 
+                             P = air_pressure, 
+                             RH = rel_humidity, 
+                             ed = vapour_pressure,
+                             # tsun = sunshine_hours # not complete data available!
+                             na.rm=T),
+         PET_hargreaves = hargreaves(Tmin = t_min, 
+                                     Tmax = t_max, 
+                                     lat = lat_station, 
+                                     Pre = precipitation),
+         PET_thornthwaite = thornthwaite(Tave = t_mean, 
+                                         lat = lat_station))
+
+
+# Then the Waterbalance is calculated as: Precipitation minus PET_penman:
+
+monthly_climate <- monthly_climate %>% 
+  mutate(D = precipitation-PET_penman)
+
+# Converting the climate datatframe into a timeseries object, for the calculation of SPEI:
+climate_ts <- ts(monthly_climate[,-c(1:2)], 
+                 start=c(1973, 1),  
+                 frequency=12) # means that I have monthly data input, so 12 month is one next time object (year)  
+
+
+```
+
+
+## 1.6. Calculation of SPEI
+
+Calculation of the SPEI values in three different time scales: 12 months, 6 months and 3 months with reference period of 40 years from 1986 to 2025  
+
+```{r calculation SPEI}
+# caclcualte the SPEI for 3 different time scales with the spei() function
+spei12 <- spei(climate_ts[,'D'], 
+               scale=12, # time scale 12 means, the actual month plus the 11 before
+               ref.start=c(1986,1), 
+               ref.end=c(2025,12))
+
+spei06 <- spei(climate_ts[,'D'], 
+               scale=6, # time scale 6 means, the actual month plus the 5 before
+               ref.start=c(1986,1), 
+               ref.end=c(2025,12))
+
+spei03 <- spei(climate_ts[,'D'], 
+               scale=3, # time scale 3 means, the actual month plus the 2 before
+               ref.start=c(1986,1), 
+               ref.end=c(2025,12))
+
+# extract the calculated values of SPEI
+spei_12 <- as.numeric(spei12$fitted) 
+spei_06 <- as.numeric(spei06$fitted)
+spei_03 <- as.numeric(spei03$fitted)
+
+# sum(is.na(spei_12)) 
+# note: it is normal that the first 11 values are NA, because with scale=12 the spei function always takes the actual month plus the past 11 month into the calculation. (for scale=6, 5 NAs, for scale=3, 2 NAs respectively)
+
+
+# add the spei variables to the original data frame
+climate_spei <- 
+  monthly_climate %>% 
+  add_column(spei_12) %>% 
+  add_column(spei_06) %>% 
+  add_column(spei_03)
+
+```
+
+
+## 1.7. Supplem. Fig. S5
+
+```{r SPEI Figures, fig.height = 3, fig.width = 5, fig.align = "center"}
+
+# dataframe for SPEI-12 
+spei_data_12 <- 
+  climate_spei %>% 
+  filter(year >= 1985) %>% 
+  filter(month == 12) %>% # filter month 12, because there we have the month December, plus the 11 months before, i.e. the whole year (see spei calculation, scale)
+  select(c(year, month, spei_12))
+
+# dataframe for SPEI-6
+spei_data_06 <-
+  climate_spei %>% 
+  filter(year >= 1985) %>% 
+  filter(month == 9) %>% # filter month 9, because there we have the month September, plus the 5 months before, i.e. the growing season from April-September (see spei calculation, scale)
+  select(c(year, month, spei_06))
+
+# dataframe for SPEI-3
+spei_data_03 <-
+  climate_spei %>% 
+  filter(year >= 1985) %>% 
+  filter(month == 7) %>% # filter month 7, because there we have the month July, plus the 2 months before, i.e. the summer season from May-July (see spei calculation, scale)
+  select(c(year, month, spei_03))
+
+
+
+# make the figures:
+
+fig_spei_12 <- spei_data_12 %>% 
+  ggplot(aes(x = year, y = spei_12)) +
+  
+  geom_hline(yintercept = 0, color = "grey30") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "grey30") +
+ 
+  geom_line(color = "grey", linewidth = 0.8) +
+  
+  geom_point(aes(fill = spei_12), shape = 21, size = 4, color = "black", show.legend = FALSE) +
+  
+  geom_hline(yintercept = 0, color = "black") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "black") +
+  
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#4575b4", midpoint = 0) +
+    
+  ylim(-2, 2.3) +
+
+  scale_y_continuous(name = "Drought Index (SPEI 12)", 
+                     breaks = seq(-2.5, 2.5, 0.5), 
+                     limits = c(-2.5, 2.5)) +
+  
+   scale_x_continuous(breaks = c(seq(from = 1985, to = 2025, by = 5)))+
+
+  theme_classic2(base_size = 16) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank()
+  )
+
+fig_spei_12
+
+
+fig_spei_06 <- spei_data_06 %>% 
+  ggplot(aes(x = year, y = spei_06)) +
+  
+  geom_hline(yintercept = 0, color = "grey30") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "grey30") +
+
+  geom_line(color = "grey", linewidth = 0.8) +
+  
+  geom_point(aes(fill = spei_06), shape = 21, size = 4, color = "black", show.legend = FALSE) +
+  
+  geom_hline(yintercept = 0, color = "black") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "black") +
+  
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#4575b4", midpoint = 0) +
+  
+  ylim(-2, 2.3) +
+
+  scale_y_continuous(name = "Drought Index (SPEI 6)", 
+                     breaks = seq(-2.5, 2.5, 0.5), 
+                     limits = c(-2.5, 2.5)) +
+  
+   scale_x_continuous(breaks = c(seq(from = 1985, to = 2025, by = 5)))+
+
+  theme_classic2(base_size = 16) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank()
+  )
+
+fig_spei_06
+
+
+
+fig_spei_03 <- spei_data_03 %>% 
+  ggplot(aes(x = year, y = spei_03)) +
+  
+  geom_hline(yintercept = 0, color = "grey30") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "grey30") +
+
+  geom_line(color = "grey", linewidth = 0.8) +
+  
+  geom_point(aes(fill = spei_03), shape = 21, size = 4, color = "black", show.legend = FALSE) +
+  
+  geom_hline(yintercept = 0, color = "black") +
+  geom_hline(yintercept = c(-1, 1), linetype = "dotted", color = "black") +
+  
+  scale_fill_gradient2(low = "#d73027", mid = "white", high = "#4575b4", midpoint = 0) +
+    
+  ylim(-2, 2.3) +
+  
+  scale_y_continuous(name = "Drought Index (SPEI 3)", 
+                     breaks = seq(-2.5, 2.5, 0.5), 
+                     limits = c(-2.5, 2.5)) +
+  
+   scale_x_continuous(breaks = c(seq(from = 1985, to = 2025, by = 5)))+
+
+  theme_classic2(base_size = 16) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.title.x = element_blank()
+  )
+
+fig_spei_03
+
+
+Figure_S5 <- ggarrange(fig_spei_12, 
+                       fig_spei_06, 
+                       fig_spei_03, 
+                       nrow=3, 
+                       labels = c("(a)", "(b)", "(c)"))
+
+
+
+```
+
+
+# 2. Climate Station on site (ARBOfun)
+## 2.1. Preparation of data frame
+
+```{r load the data}
+
+# load the weather data from the station on site ARBOfun (KranWetter2) - as 10min intervals
+data_climate_2024 <- read.csv(here("data", "raw", "ARBOfun_climate_station_data_year2024_10min.csv")) %>% 
+  rename(date = YYYY.MM.DD,
+         time = Time,
+         timestamp = Timestamp,
+         radiation_diffuse = SPN1_Diff,
+         radiation_global =SPN1_Total,
+         voltage_reference= Vref,
+         battery_status = Bat,
+         wind_direction = WiRi,
+         wind_speed = WiGe,
+         wind_speed_peak = wg_peak,
+         temperature = Ltemp,
+         rel_humidity = relFeuchte,
+         air_pressure = Ldruck,
+         precipitation_sum = Regen,
+         precipitation_duration = RegenDau,
+         hail_sum = HagelSum,
+         hail_duration = HagelDau,
+         battery_status_vaisalla = Uv,
+         soil_watercontent_15 = X2_WC,
+         soil_conductivity_pores_15 = X2_ECp,
+         soil_temperature_15 = X2_ST,
+         soil_epsilon_calibration_15 = X2_e,
+         soil_conductivity_bulk_15 = X2_ECb,
+         soil_watercontent_50 = X3_WC,
+         soil_conductivity_pores_50 = X3_ECp,
+         soil_temperature_50 = X3_ST,
+         soil_epsilon_calibration_50 = X3_e,
+         soil_conductivity_bulk_50 = X3_ECb
+         ) %>% 
+  mutate(across(starts_with("soil_"), as.numeric)) %>% 
+  unite(date_time, date, time, sep="", remove=F) %>% 
+  mutate(date =  as.Date(date, format = '%Y-%m-%d'),
+         date_time = as.POSIXct(paste(date, time), format = "%Y-%m-%d %H:%M:%S"),
+         time = format(date_time, format = "%H:%M:%S"),
+         time_hms = hms(time))
+
+
+# check the NAs
+data_climate_2024 %>%
+  filter(if_any(starts_with("soil"), is.na))
+
+# Calculate the VPD out of temperature and relative humidity
+data_climate_2024 <- data_climate_2024 %>% 
+  mutate(sVP = 0.6108 * exp((17.27 * temperature) / (temperature + 237.3)),
+         aVP = (rel_humidity / 100) * sVP,
+         VPD = sVP - aVP) %>% 
+  # calculate the diffuse fraction of radiation
+  mutate(diffuse_fraction = radiation_diffuse / radiation_global)
+
+
+# Subset the data for only our measurement days
+measurement_days <- as.Date(c(
+  "2024-06-12", "2024-06-13", "2024-06-18",
+  "2024-06-24", "2024-06-25", "2024-06-26",
+  "2024-06-27", "2024-07-09"
+))
+
+data_climate_measurementdays <- 
+  data_climate_2024  %>%
+  filter(date %in% measurement_days)
+
+data_climate_measurementdays_to_publish <- 
+  data_climate_measurementdays %>%
+  dplyr::select(c(date, date_time, time, temperature, VPD, rel_humidity, air_pressure, radiation_global, radiation_diffuse, wind_speed, wind_speed_peak, precipitation_sum, soil_watercontent_15, soil_watercontent_50, soil_temperature_15, soil_temperature_50))
+
+write_csv(data_climate_measurementdays_to_publish, here("data", "processed", "climate_measurement_days_ARBOfun.csv"))
+
+```
+
+
+## 2.2. VPDleaf from porometer
+
+The porometer devices log with each measurement also the leaf-to-air VPD, which we need to relate it to ambient VPD.
+
+```{r join stom con data}
+
+# load the measurement data from the porometers to use the environemental variables
+# that were measured by the device directly (VPDleaf)
+stom_con <- read_csv(here("data", "processed", "data_cleaned.csv"))
+
+# join the weather data to the main data
+ data <- 
+  stom_con %>% 
+  rename(day = date) %>% 
+  arrange(date_time) %>% 
+  mutate(nearest_time = lubridate::round_date(date_time, unit = "10 mins")) %>% 
+  left_join(data_climate_measurementdays, 
+            by = c("nearest_time" = "date_time")) %>%
+  # create a date variable that is character
+  mutate(day_chr= as.character(day)) %>% 
+  # add new interpolated VPD column
+  # For each leaf measurement time, look up the nearest two weather station measurements and linearly interpolate the air VPD, so     that each leaf measurement has a matching air VPD.
+  mutate(
+    VPD_air_interp = approx( # base R linear interpolation function with x and y and the new estimates for xout
+      x = data_climate_measurementdays$date_time, # the known time points from the weather station
+      y = data_climate_measurementdays$VPD, # these are the corresponding air VPD from the weather station
+      xout = date_time # the time points of my leaf VPD measurements, for which we want extimated values
+    )$y # since we only want the interpolated VPD values not x and y
+  ) %>% 
+  # species as a factor
+  mutate(species=as.factor(species)) %>% 
+  mutate(tree_id=as.factor(tree_id)) %>% 
+    # add a variable that has 1, 2, 3 per tree individual
+  group_by(species) %>%
+  mutate(tree_id_num = as.factor(as.numeric(factor(tree_id)))) %>%
+  ungroup() %>% 
+  # create a unique leaf_id variable
+  unite("leaf_id", tree_id, leaf_nr, sep="_", remove=F) %>% 
+  group_by(day) %>%
+  mutate(
+    first_time = min(date_time, na.rm = TRUE),
+    last_time  = max(date_time, na.rm = TRUE),
+    first_measurement = format(min(date_time, na.rm = TRUE), "%H:%M:%S"),
+    last_measurement  = format(max(date_time, na.rm = TRUE), "%H:%M:%S")
+  ) %>%
+  ungroup() %>% 
+   group_by(day) %>% 
+   mutate(trees_measured = n_distinct(tree_id))
+
+```
+
+
+
+
+## 2.3. Supplem. Fig. S1 - VPD measurement days
+
+```{r VPD figure, fig.width=3, fig.height=3}
+
+measurement_times <- data %>% 
+  dplyr::select(date, first_time, last_time) %>% 
+  distinct() %>%
+  mutate(
+    first_time = hms::as_hms(first_time),
+    last_time  = hms::as_hms(last_time)
+  )
+
+
+for_vpd_fig <- data_climate_measurementdays %>%
+  left_join(measurement_times, by = "date") %>% 
+  mutate(
+    in_window = time_hms >= first_time & time_hms <= last_time
+  )
+
+
+fig_vpd <- 
+  ggplot(for_vpd_fig,
+       aes(x = time_hms, y = VPD, group = date)) +
+
+  # full line in grey
+  geom_line(color = "grey85", linewidth = 1) +
+
+  # colored section within measurement window
+  geom_line(data = subset(for_vpd_fig, in_window),
+            aes(color = factor(date)),
+            linewidth = 1) +
+
+  scale_color_brewer(palette = "Set2") +
+
+  labs(y = "Air VPD [kPa]", 
+       x = "time (CET)",
+       color = "Date") +
+
+scale_x_time(
+  expand = c(0, 0),
+    breaks = scales::breaks_width("1 hour"),
+  labels = scales::label_time("%H:%M")
+) +
+
+  theme_bw(base_size = 18) +
+
+  theme(
+    # axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+fig_vpd
+
+rm(for_vpd_fig)
+
+```
+
+## 2.4. Supplem. Fig. S2 - VPD leaf vs. VPD air
+
+```{r VPD leaf vs. VPD air, fig.height=10, fig.width=10}
+
+# model of the VPDleaf vs VPDair
+conversion_model <- lmer(
+  VPD_air_interp ~ VPDleaf * species + (1|tree_id), 
+  data = data)
+
+summary(conversion_model)
+anova(conversion_model)
+
+# Estimated slopes per species
+slopes_per_species <- emtrends(conversion_model, ~ species, var = "VPDleaf")
+
+slopes_df <- as.data.frame(slopes_per_species)
+
+#  Calculate R² per species
+r2_per_species <- data %>%
+  group_by(species) %>%
+  group_modify(~ {
+    model <- lmer(
+      VPD_air_interp ~ VPDleaf + (1 | tree_id),
+      data = .x
+    )
+    
+    r2vals <- performance::r2(model)
+    
+    tibble(
+      R2_marginal = r2vals$R2_marginal,
+      R2_conditional = r2vals$R2_conditional
+    )
+  })
+
+#  Merge R² back to leaf_data for plotting
+data_for_figure <- data %>%
+  left_join(r2_per_species, by = "species")
+
+
+newdata <- data %>%
+  group_by(species) %>%
+  summarise(
+    VPDleaf = list(seq(
+      min(VPDleaf, na.rm = TRUE),
+      max(VPDleaf, na.rm = TRUE),
+      length.out = 200
+    )),
+    .groups = "drop"
+  ) %>%
+  tidyr::unnest(VPDleaf)
+
+newdata$pred <- predict(
+  conversion_model,
+  newdata = newdata,
+  re.form = NA
+)
+  
+#  Figure:
+conversion_fig <- 
+  ggplot(data_for_figure, 
+         aes(x = VPDleaf, 
+             y = VPD_air_interp)) +
+  geom_abline(slope=1, colour="lightgrey") +
+  geom_point(aes(colour=as.factor(tree_individual)), 
+             alpha = 0.4, ) +
+  geom_line(data=newdata, 
+            aes(x=VPDleaf, 
+                y=pred), 
+            color = "darkred") +
+  geom_text(
+    data = r2_per_species,
+    aes(
+      x = 6,    # fixed x position for all facets
+      y = 4,    # fixed y position for all facets
+      label = paste0("R² = ", round(R2_conditional, 2))
+    ),
+    hjust = 1, vjust = 1,
+    inherit.aes = FALSE
+  ) +
+  scale_colour_manual(values= c("#4C78A8", "#72B7B2", "#A0AEC0")) +
+  facet_wrap(~species, ncol=5) +
+  labs(
+    x = "Leaf VPD (kPa)",
+    y = "Interpolated Air VPD (kPa)"
+  ) +
+  theme_bw() +
+    theme(legend.position = "none")
+
+conversion_fig
+
+```
+
+
+
+## 2.5. Supplem. Tab. S1 - Environmental Conditions
+
+```{r supplementary table environmental conditions}
+
+median_table <- 
+  data %>% 
+  group_by(day) %>% 
+  filter(date_time >= first_time & date_time <= last_time) %>%
+  ungroup() %>% 
+  group_by(day, first_measurement, last_measurement, trees_measured) %>% 
+  summarise(
+        VPD = median(VPD, na.rm = TRUE),
+        temperature = median(temperature, na.rm = TRUE),
+        rel_humidity = median(rel_humidity, na.rm = TRUE),
+        wind_speed = median(wind_speed, na.rm = TRUE),
+        radiation_global = median(radiation_global, na.rm = TRUE),
+        fract_diff_radiation = median(diffuse_fraction, na.rm = TRUE),
+        soil_moisture_15 = median(soil_watercontent_15, na.rm = TRUE),
+        soil_moisture_50 = median(soil_watercontent_50, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+median_table
+
+```
+
+# 3. Soil Conditions
+
+### 3.1. UFZ Drought Monitoring Germany
+
+```{r load the data from UFZ}
+
+
+
+```
+
+
+
+
+## 3.2. Supplem. Fig. S2
+
+### 3.2.1. S2a - Drought Monitor 2024
+
+```{r map}
+
+
+
+
+```
+
+
+
+### 3.2.2. S2b - Soil moisture daily
+
+```{r soil moisture}
+
+# prepare the dataframe
+Soil_Moisture_2024 <- data_climate_2024 %>%
+  dplyr::select(timestamp, date_time, time, date, time_hms, starts_with("soil")) %>% 
+  pivot_longer(cols=starts_with("soil"),
+               names_to = c(".value", "depth"),
+               names_pattern = "(.+)_([0-9]+)$")
+
+Soil_Moisture_Measurementdays <- 
+Soil_Moisture_2024 %>% 
+  filter(date=="2024-06-12" | date=="2024-06-13" | date=="2024-06-18" | date=="2024-06-24" | date=="2024-06-25" | date=="2024-06-26" | date=="2024-06-27" | date=="2024-07-09")
+
+measurement_days <- Soil_Moisture_Measurementdays %>% distinct(date) %>% pull(date)
+  
+
+
+
+for_soil_fig <- data_climate_measurementdays %>%
+    dplyr::select(timestamp, date_time, time, date, time_hms, starts_with("soil")) %>% 
+  pivot_longer(cols=starts_with("soil"),
+               names_to = c(".value", "depth"),
+               names_pattern = "(.+)_([0-9]+)$") %>% 
+  left_join(measurement_times, by = "date") %>% 
+  mutate(
+    in_window = time_hms >= first_time & time_hms <= last_time
+  )
+
+plot_data <- for_soil_fig %>% 
+  filter(depth==50)
+
+
+fig_soil_moist <- 
+  plot_data %>% 
+  ggplot(
+       aes(x = time_hms, y = soil_watercontent, group = date)) +
+  # since it was all in the range between FC and WP:
+    annotate("rect", xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf,
+           fill = "steelblue", alpha = 0.1) +
+
+  # full line in grey
+  geom_line(color = "grey85", linewidth = 1) +
+
+  # colored section within measurement window
+# colored section within measurement window
+  geom_line(data = subset(for_soil_fig, in_window & depth == 50), 
+            aes(color = factor(date), group = date),             
+            linewidth = 1) +
+
+  scale_color_brewer(palette = "Set2") +
+
+  labs(y = "Volumetric soil moisture content [%]", 
+       x = "Time (CET)",
+       color = "Date") +
+
+scale_x_time(
+  expand = c(0, 0),
+    breaks = scales::breaks_width("1 hour"),
+  labels = scales::label_time("%H:%M")
+) +
+
+  theme_bw(base_size = 18) +
+ylim(13.2, 25.5) +
+  theme(
+    # axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+fig_soil_moist
+
+```
+
+
+### 3.2.3. S2 joined
+```{r supplementary soil moisture joined, fig.width=9, fig.height=10}
+
+# Stack Plot A over Plot B
+Figure_S2 <- Supplementary_Figure_soil_moist_50cm_zone /fig_soil_moist + 
+  plot_layout(guides = "keep", design = "A\nB") + # Keeps a single legend if they share the same scale
+  plot_annotation(tag_levels = "A")   # Automatically adds 'A' and 'B' to the top left
+
+Figure_S2
+
+```
+
+
+## 3.3. Supplem Fig. S3 - Stratification of measurement days
+
+```{r measurement days justification}
+
+days_trees <- data %>% 
+  dplyr::select(species, tree_id, day) %>% 
+  distinct()
+
+days_moist <- data %>% 
+  dplyr::select(species, tree_id, day, soil_watercontent_50) %>% 
+  group_by(species, tree_id, day) %>% 
+  summarize(soil_moist = mean(soil_watercontent_50)) %>% 
+  ungroup() %>% 
+  group_by(species) %>% 
+  mutate(mean_per_sp = mean(soil_moist)) %>% 
+  ungroup()
+
+mean_all_days <- data %>% 
+  ungroup %>%  
+  dplyr::select(soil_watercontent_50) %>% 
+  summarize(mean_soil_moist = mean(soil_watercontent_50)) %>% 
+  pull()
+
+
+Figure_S3 <- days_moist %>% 
+  ggplot(aes(species, soil_moist)) + 
+  geom_hline(yintercept=mean_all_days, color="black", linewidth=0.5, linetype="dashed") + 
+  geom_path(aes(colour=mean_per_sp), linewidth=1) + 
+  geom_point(aes(colour=soil_moist), shape=19, size=2.5) +  
+  ylab("Mean soil water content [%] on measurement day") + 
+  xlab("Species") +
+scale_colour_gradientn(
+    name = "Soil water content [%]",
+  colours = c(
+    "#DCEAF7",  # very light blue
+    "#6BAED6",  # medium blue
+    "#08519C"   # dark blue
+  )
+) +
+  theme_minimal() + 
+  theme(
+  axis.text.x = element_text(
+    size = 7,
+    angle = 90,
+    vjust = 0.5,
+    hjust = 1,
+    face = "italic"
+  ),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    legend.position = "right"
+  )
+Figure_S3
+
+```
+

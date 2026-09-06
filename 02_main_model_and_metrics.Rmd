@@ -1,0 +1,2099 @@
+---
+title: "Stomatal Behaviour 2026 - Main model and metrics"
+author: "Lena Sachsenmaier"
+output:
+  html_document:
+    df_print: paged
+contact: lena.sachsenmaier.research@gmail.de
+created: "2025-07-30"
+updated: "`r format(Sys.time(), '%d %B, %Y')`"
+---
+
+
+
+```{r setup}
+library(tidyverse) # core data manipulation
+library(here) # reproducible file paths
+
+# Bayesian modelling
+library(brms)
+library(loo)
+library(bayesplot) # for diagnostics and figures of brms() models
+library(tidybayes) # for easy viusalization of bayesian models
+
+# correlation analysis
+library(Hmisc) # for correlation matrix
+library(scales) # for rescaling variables for PCA
+
+# moving window calculations
+library(zoo)
+
+# figure layout
+library(patchwork)
+library(ggrepel)
+library(ggh4x) # for plotting figures (facet with different axis labels)
+library(ggnewscale) # for adding a new colour scale
+
+# export supplementary tables
+library(writexl) # for writing excel tables
+
+```
+
+# 1.Preparation of data frame
+
+## 1.1 Load data frame
+
+(This data frame is already cleaned by the previous R script 01_cleaning.rmd.)
+
+```{r load data}
+
+data <- read_csv(here("data", "processed", "data_cleaned.csv"))
+
+```
+
+
+## 1.2. Preparation of variables for modeling
+
+```{r variable preparation}
+
+data <- data %>% 
+  mutate(Qamb_sc = as.numeric(scale(Qamb)),
+         species=as.factor(species),
+         tree_id=as.factor(tree_id)) %>% 
+  # create a unique leaf_id variable
+  unite("leaf_id", tree_id, leaf_nr, sep="_", remove=F) %>% 
+  mutate(leaf_id = as.factor(leaf_id))
+
+```
+
+## 1.3. Helper vectors and functions
+
+```{r helper functions}
+
+# create grids for later predictions
+# for figures it's enough if VPDleaf reaches until 6 kPa
+# for calculation of metrics we use a larger range
+
+VPD_grid_plot <- seq(0,6, length.out = 1000)
+
+VPD_grid_metrics <- seq(0,15, length.out = 1000)
+
+
+create_prediction_grid <- function(sp, VPD_grid) {
+  tibble(
+    VPDleaf = VPD_grid,
+    species = sp,
+    tree_id = NA,
+    leaf_id = NA,
+    # Ambient light is held at its mean observed level.
+   # Qamb_sc = 0 corresponds to mean Qamb because Qamb was standardized.
+    Qamb_sc = 0
+  )
+}
+
+# Create prediction data for every measured leaf of one species.
+# Leaf and tree identifiers are retained so random effects are included.
+create_prediction_grid_leaf <- function(sp, VPD_grid, data) {
+  data_species <- data %>% filter(species == sp)
+  tibble(
+    VPDleaf = rep(VPD_grid, times = nrow(data_species)),
+    species = sp,
+    tree_id = rep(data_species$tree_id, each = length(VPD_grid)),
+    leaf_id = rep(data_species$leaf_id, each = length(VPD_grid)),
+    Qamb_sc = 0
+  )
+}
+
+
+
+
+# Extract the posterior predictions
+# Each posterior draw represents one plausible stomatal response curve.
+predict_posterior_curves <- function(sp, nd, model, ndraws = 1000) {
+  ep <- posterior_epred(
+    model,
+    newdata = nd,
+    # ignore random effects
+    re_formula = NA,   # ignore random effects
+    ndraws = ndraws
+  )
+  
+  tibble(
+    VPD  = rep(nd$VPDleaf, times = ndraws),
+    draw = rep(seq_len(ndraws), each = length(nd$VPDleaf)),
+    gsw  = as.vector(t(ep))
+  )
+}
+
+
+# Calculate the posterior mean prediction per species.
+# This represents the average population-level response curve.
+predict_mean_curve <- function(sp, nd, model) {
+  ep_mean <- posterior_epred(
+    model,
+    newdata = nd,
+    # ignore random effects
+    re_formula = NA
+  ) %>% colMeans()
+  
+  tibble(
+    VPD = nd$VPDleaf,
+    gsw_mean = ep_mean
+  )
+}
+
+
+
+# Predict leaf-specific response curves including random effects.
+# Posterior predictions are averaged across sampled draws.
+predict_leaf_curves <- function(nd, model, ndraws = 50) {
+  ep <- posterior_epred(
+    model,
+    newdata = nd,
+    re_formula = NULL,  # include random effects
+    ndraws = ndraws
+  )
+  # posterior_epred returns n_draws × nrow(nd), need to transpose
+  ep_mean <- colMeans(ep)  # mean across draws for each row
+  
+  tibble(
+    VPD = nd$VPDleaf,
+    gsw = ep_mean,
+    leaf_id = nd$leaf_id,
+    tree_id = nd$tree_id
+  )
+}
+
+# specify colour selection for later figures
+pastel <- c("#4EA8DE", "#A29BFE", "#5B7065")
+
+```
+
+
+
+
+
+# 2. Modelling gsw - Bayesian Framework
+
+## 2.1. Final model
+
+```{r final model}
+
+# the model formula
+model_formula <- bf(
+  gsw ~ (a * pow(VPDleaf, k) * exp(-b * VPDleaf)),
+  a ~ 0 + species + species:Qamb_sc + (1|tree_id/leaf_id),
+  b ~ 0 + species + (1|tree_id/leaf_id),
+  k ~ 0 + species + (1|tree_id/leaf_id),
+  nl = TRUE
+)
+
+# priors for the model
+priors_model <- c(
+  # restricted to be positive
+  prior(lognormal(log(0.7), 0.7), nlpar = "a", lb=0),
+  prior(lognormal(log(1), 0.7), nlpar = "b", lb=0),
+  # restricted to be positive and restricted to not explode, because it's the most sensible parameter
+  prior(lognormal(0, 1), nlpar = "k", lb=0, ub=4), 
+  prior(student_t(3, 0, 1), class = "sigma"),
+  prior(gamma(2, 0.1), class = "nu"))
+
+
+# fit model (caution: takes several hours)
+model <- brm(
+  formula = model_formula,
+  data = data,
+  family = student(),
+  prior = priors_model,
+  chains = 4,
+  cores = 4,
+  iter = 4000,
+  warmup = 2000,
+  control = list(adapt_delta = 0.95),
+  save_pars = save_pars(all = TRUE),
+  file = here::here("output", "models", "final_model"),
+  file_refit = "on_change"
+)
+
+# # Optional:
+# # # Reload previously fitted model, in case you did not have time to run it
+# model <- readRDS(here::here("output", "models", "final_model.rds"))
+
+
+```
+
+## 2.2. Posterior predictions
+```{r posterior predictions of the model}
+
+
+# data <- data %>% mutate(species= case_when(
+#                                   species=="Pla_his" ~ "Pla_ace", 
+#                                   species=="Cor_dom" ~ "Sor_dom",
+#                                   species=="Tor_gla" ~ "Sor_tor",
+#                                   TRUE ~ species))
+
+species_list <- unique(data$species)
+species_list
+
+# predict 100 single posterior draws per species
+posterior_draws <- map_df(species_list, function(sp) {
+  nd <- create_prediction_grid(sp, VPD_grid_plot)
+  predict_posterior_curves(sp, nd, model, ndraws = 100) %>% 
+    mutate(species = sp)
+})
+
+# 
+# posterior_draws <- posterior_draws %>% mutate(species= case_when(
+#                                   species== "Pla_ace" ~ "Pla_his",
+#                                   species=="Sor_dom" ~ "Cor_dom",
+#                                   species== "Sor_tor" ~ "Tor_gla",
+#                                   TRUE ~ species)) %>% 
+#   arrange(species)
+
+# predict species mean curves across all draws:
+posterior_means <- map_df(species_list, function(sp) {
+  nd <- create_prediction_grid(sp, VPD_grid_plot)
+  predict_mean_curve(sp, nd, model) %>% 
+    mutate(species = sp)
+})
+
+# posterior_means <- posterior_means %>% mutate(species= case_when(
+#                                   species== "Pla_ace" ~ "Pla_his",
+#                                   species=="Sor_dom" ~ "Cor_dom",
+#                                   species== "Sor_tor" ~ "Tor_gla",
+#                                   TRUE ~ species)) %>% 
+#   arrange(species)
+# 
+# data <- data %>% mutate(species= case_when(
+#                                   species== "Pla_ace" ~ "Pla_his",
+#                                   species=="Sor_dom" ~ "Cor_dom",
+#                                   species== "Sor_tor" ~ "Tor_gla",
+#                                   TRUE ~ species)) %>% 
+#   arrange(species)
+
+```
+
+
+## 2.3. Model diagnostics
+
+```{r diagnostics final model}
+
+# checking the model summary
+summary_model <- as.data.frame(posterior_summary(model))
+
+summary(model)
+
+pp_check(model)
+
+bayes_R2(model)
+
+# checking the residuals
+
+res <- residuals(model)
+fit <- fitted(model)
+
+res_vals <- res[, "Estimate"]
+fit_vals <- fit[, "Estimate"]
+
+
+plot(fit_vals, res_vals,
+     xlab = "Fitted values",
+     ylab = "Residuals")
+abline(h = 0, col = "red")
+
+# residuals vs. VPDleaf (my key predictor)
+plot(data$VPDleaf, res_vals,
+     xlab = "VPDleaf",
+     ylab = "Residuals")
+abline(h = 0, col = "red")
+
+# distribution of residuals
+hist(res_vals, breaks = 30,
+     main = "Residual distribution",
+     xlab = "Residuals")
+
+## Priors check
+
+model_check_priors <- brm(
+  formula = model_formula,
+  data = data,
+  family = student(),
+  prior = priors_model,
+  chains = 4,
+  cores = 4,
+  iter = 4000,
+  warmup = 2000,
+  sample_prior = "only",
+  control = list(adapt_delta = 0.95),
+  save_pars = save_pars(all = TRUE),
+  file = here::here("output", "model_prior_check"),
+  file_refit = "on_change"
+)
+
+# # Optional:
+# # Reload previously fitted model, in case you did not have time to run it
+# model_check_priors <- readRDS(here::here("output", "models", "model_prior_check.rds"))
+
+VPD_grid <- seq(0, 6, length.out = 100)
+
+baseline <- data.frame(
+  VPDleaf = VPD_grid,
+  species = levels(data$species)[1],
+  Qamb_sc = 0
+)
+
+# Extract predictor draws
+prior_samples_grid <- posterior_epred(
+  model_check_priors,
+  newdata = baseline,
+  transform = TRUE,
+  re_formula = NA
+)
+
+# Sample 100 draws and format for ggplot
+set.seed(123)
+
+draw_indices <- sample(1:nrow(prior_samples_grid), 100)
+pp_curves_sampled <- prior_samples_grid[draw_indices, ]
+
+# Convert the matrix to a long-format data frame for ggplot
+plot_data <- as.data.frame(t(pp_curves_sampled)) %>%
+  mutate(VPDleaf = VPD_grid) %>%
+  pivot_longer(
+    cols = -VPDleaf,
+    names_to = "draw",
+    values_to = "gsw"
+  )
+
+fig_prior_predictive <- ggplot(plot_data, aes(x = VPDleaf, y = gsw, group = draw)) +
+  geom_line(alpha = 0.3, color = "royalblue", linewidth = 0.5) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(
+    x = expression(Vapor~Pressure~Deficit~(VPD[leaf]*", kPa")),
+    y = expression(Stomatal~Conductance~(italic(g)[sw]*", mol "~m^{-2}~s^{-1}))
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(face = "plain")
+  )
+
+## Model convergence - visualization
+## Creates the default brms diagnostic plots, including
+## trace plots and posterior density plots for all parameters.
+
+diagn_plot_model_final <- plot(model, ask = FALSE)
+
+for (i in seq_along(diagn_plot_model_final)) {
+  ggsave(
+    filename = here("output", paste0("trace_plot_", i, ".png")),
+    plot = diagn_plot_model_final[[i]],
+    width = 8,
+    height = 6,
+    dpi = 300
+  )
+}
+
+## Check the parameter correlations
+
+post <- as_draws_df(model)
+
+species_list <- unique(data$species)
+
+for (sp in species_list) {
+
+  vars_sp <- c(
+    paste0("b_a_species", sp),
+    paste0("b_b_species", sp),
+    paste0("b_k_species", sp)
+  )
+
+  p <- mcmc_pairs(
+    post,
+    pars = vars_sp
+  )
+
+  ggsave(
+    filename = here("output", "pairs_species", paste0("pairs_", sp, ".png")),
+    plot = p,
+    width = 6,
+    height = 6
+  )
+}
+
+
+```
+
+
+## 2.3. Model Output - Tab. S4-S5
+
+```{r tables supplement}
+
+# summary of fixed effects
+fixed_effects_long <- as.data.frame(posterior_summary(model)) %>%  
+  rownames_to_column(var = "Parameter_Raw") %>% 
+  filter(str_detect(Parameter_Raw, "^b_(a|b|k)_species")) %>% 
+  mutate(
+    Effect_Type = "Fixed",
+    # Clean parameter names (e.g., "a", "a:Qamb_sc")
+    Parameter = str_replace(Parameter_Raw, "^b_", "") %>% 
+                str_replace("_species[A-Za-z_]+", ""),
+    # Extract species name
+    Species = str_extract(Parameter_Raw, "(?<=_species)[A-Za-z_]+")
+  )
+
+# summary of random effects:
+random_effects_long <- as.data.frame(posterior_summary(model)) %>%  
+  rownames_to_column(var = "Parameter_Raw") %>% 
+  filter(str_detect(Parameter_Raw, "^sd_|^sigma|^nu")) %>%
+  mutate(
+    Species = NA_character_, 
+    Effect_Type = case_when(
+      str_detect(Parameter_Raw, "tree_id:leaf_id") ~ "Random: tree_id:leaf_id",
+      str_detect(Parameter_Raw, "tree_id") ~ "Random: tree_id",
+      str_detect(Parameter_Raw, "sigma")   ~ "Residual (sigma)",
+      str_detect(Parameter_Raw, "nu")      ~ "Distribution Parameter (nu)",
+      TRUE                                 ~ "Random: Group"
+    ),
+    Parameter = case_when(
+      str_detect(Parameter_Raw, "sigma") ~ "Sigma",
+      str_detect(Parameter_Raw, "nu")    ~ "Nu",
+      str_detect(Parameter_Raw, "__")    ~ {
+        raw_param <- str_extract(Parameter_Raw, "(?<=__)[a-zA-Z_]+")
+        # Remove "Intercept" if it's attached to a specific parameter like "a_Intercept"
+        clean_param <- str_replace(raw_param, "_Intercept|^Intercept", "")
+        # If it was just the bare intercept, name it "Intercept", otherwise name it "SD_a", "SD_b", etc.
+        if_else(clean_param == "" | is.na(clean_param), "SD_Intercept", paste0("SD_", clean_param))
+      },
+      TRUE                                ~ "SD_Global"
+    )
+  ) %>% 
+  mutate(Parameter = case_when(Parameter=="SD_a" ~ "a",
+                               Parameter=="SD_b" ~ "b",
+                               Parameter=="SD_k" ~ "k",
+                               TRUE ~ Parameter))
+
+
+# join the fixed and random effects summary
+summary_table <- bind_rows(fixed_effects_long, random_effects_long) %>% 
+  mutate(
+    Cell_Value = paste0(round(Estimate, 2), " [", round(`Q2.5`, 2), ", ", round(`Q97.5`, 2), "]")
+  ) %>% 
+  dplyr::select(Effect_Type, Species, Parameter, Cell_Value) %>% 
+  pivot_wider(
+    names_from = Parameter,
+    values_from = Cell_Value
+  )
+
+summary_table
+
+
+
+
+
+# Find the highest Rhat in the entire model
+max_rhat <- max(brms::rhat(model), na.rm = TRUE)
+
+# Find the lowest Effective Sample Sizes in the entire model
+min_bulk <- min(brms::neff_ratio(model) * brms::nsamples(model), na.rm = TRUE)
+
+cat("Worst Rhat in the entire model:", round(max_rhat, 3), "\n")
+cat("Lowest Bulk-ESS in the entire model:", round(min_bulk, 0), "\n")
+
+
+# raw diagnostics
+# all_diagnostics <- brms::rhat(model) %>% 
+#   as.data.frame() %>% 
+#   rownames_to_column(var = "Parameter_Raw") %>% 
+#   rename(Rhat = ".") %>% 
+#   mutate(
+#     Bulk_ESS = brms::neff_ratio(model)[Parameter_Raw] * brms::ndraws(model),
+#     Tail_ESS = brms::neff_ratio(model)[Parameter_Raw] * brms::ndraws(model) 
+#   )
+
+
+library(posterior)
+
+diag_df <- brms::as_draws_array(model) %>%
+  summarise_draws("rhat", "ess_bulk", "ess_tail") %>%
+  rename(
+    Parameter_Raw = variable,
+    Rhat = rhat,
+    Bulk_ESS = ess_bulk,
+    Tail_ESS = ess_tail
+  )
+
+all_diagnostics <- diag_df %>%
+  dplyr::select(Parameter_Raw, Rhat, Bulk_ESS, Tail_ESS)
+
+# all_diagnostics <- as.data.frame(posterior_summary(model)) %>% 
+#   rownames_to_column(var = "Parameter_Raw") %>%
+#   dplyr::select(Parameter_Raw, Rhat, Bulk_ESS, Tail_ESS)
+
+# Keep fixed effects AND the global random / residual / nu structures
+diagnostics_long <- all_diagnostics %>% 
+  filter(
+    str_detect(Parameter_Raw, "^b_(a|b|k)_species") | # Fixed species parameters
+    str_detect(Parameter_Raw, "^sd_|^sigma|^nu")      # Global random, residual, and nu
+  ) %>% 
+  mutate(
+    # Determine effect type
+    Effect_Type = case_when(
+      str_detect(Parameter_Raw, "^b_")             ~ "Fixed",
+      str_detect(Parameter_Raw, "tree_id:leaf_id") ~ "Random: tree_id:leaf_id",
+      str_detect(Parameter_Raw, "tree_id")         ~ "Random: tree_id",
+      str_detect(Parameter_Raw, "sigma")           ~ "Residual (sigma)",
+      str_detect(Parameter_Raw, "nu")              ~ "Distribution Parameter (nu)",
+      TRUE                                         ~ "Random: Group"
+    ),
+    
+    # Extract species name only for fixed rows
+    Species = if_else(Effect_Type == "Fixed", 
+                      str_extract(Parameter_Raw, "(?<=_species)[A-Za-z_]+"), 
+                      NA_character_),
+    
+    # Clean the Parameter column so everything aligns horizontally
+    Parameter = case_when(
+      Effect_Type != "Fixed" & str_detect(Parameter_Raw, "sigma") ~ "Sigma",
+      Effect_Type != "Fixed" & str_detect(Parameter_Raw, "nu")    ~ "Nu",
+      str_detect(Parameter_Raw, "__") ~ {
+        raw_param <- str_extract(Parameter_Raw, "(?<=__)[a-zA-Z_]+")
+        clean_param <- str_replace(raw_param, "_Intercept|^Intercept", "")
+        if_else(clean_param == "" | is.na(clean_param), "Intercept", clean_param)
+      },
+      TRUE ~ str_replace(Parameter_Raw, "^b_", "") %>% str_replace("_species[A-Za-z_]+", "")
+    )
+  ) %>% 
+  dplyr::select(Parameter, Species, Effect_Type, Rhat, Bulk_ESS, Tail_ESS)
+
+
+wide_diagnostics_columns <- diagnostics_long %>%
+  pivot_wider(
+    names_from = Parameter,
+    values_from = c(Rhat, Bulk_ESS, Tail_ESS),
+    names_glue = "{Parameter}_{.value}"
+  ) %>% 
+  # Round numbers nicely
+  mutate(across(contains("Rhat"), ~ sprintf("%.2f", .x))) %>% 
+  mutate(across(contains("ESS"), ~ sprintf("%.0f", .x)))
+
+wide_diagnostics_columns
+
+# wide_diagnostics_columns <- wide_diagnostics_columns %>%  mutate(Species= case_when(
+#                                   Species== "Pla_ace" ~ "Pla_his",
+#                                   Species=="Sor_dom" ~ "Cor_dom",
+#                                   Species== "Sor_tor" ~ "Tor_gla",
+#                                   TRUE ~ Species)) %>% 
+#   arrange(Species)
+
+
+# export the supplementary tables S4 and S5
+
+write_xlsx(summary_table, here("output", "Table_S5_model_summary_table.xlsx"))
+
+write_xlsx(wide_diagnostics_columns, here("output", "Table_S4_model_diagnostics_table.xlsx"))
+
+```
+
+
+
+# 3. Stomatal Behaviour Metrics
+
+## 3.1. Extraction of metrics
+
+```{r extract metrics from the posterior curves}
+
+
+# Create prediction data for all species using the metrics VPD range
+newdata <- map_df(
+  unique(data$species),
+  ~ create_prediction_grid(.x, VPD_grid_metrics)
+)
+
+# Population-level posterior predictions
+ep <- posterior_epred(
+  model,
+  newdata = newdata,
+  re_formula = NA
+)
+
+# here we use all the available draws (n=4000)
+ndraws <- nrow(ep)
+
+
+# Convert to tidy format
+
+posterior_curves <- tibble(
+  species = rep(newdata$species, times = ndraws),
+  VPDleaf = rep(newdata$VPDleaf, times = ndraws),
+  draw = rep(seq_len(ndraws), each = nrow(newdata)),
+  gsw = as.vector(t(ep))
+) %>% 
+  arrange(species, draw, VPDleaf) %>%
+  group_by(species, draw)
+
+
+# extraction of metrics
+stomatal_behaviour_metrics <- posterior_curves %>%
+  group_modify(~{
+
+    vpd   <- .x$VPDleaf
+    epred <- .x$gsw
+
+    ord <- order(vpd)
+
+    vpd   <- vpd[ord]
+    epred <- epred[ord]
+
+    n <- length(vpd)
+
+    # safety
+    if (n < 6) {
+      return(tibble(
+        VPD_opt      = NA_real_,
+        gsw_max      = NA_real_,
+        VPD50         = NA_real_,
+        Sclosure = NA_real_
+      ))
+    }
+
+    # find the peak of the curve
+    # and extract the peak value (gs_max) and the VPDopt
+
+    peak_idx <- which.max(epred)
+
+    VPD_opt <- vpd[peak_idx]
+    gs_max <- epred[peak_idx]
+
+    half_val <- 0.5 * gs_max
+
+    # extract VPD50
+
+    VPD50 <- NA_real_
+
+    if (peak_idx < n) {
+
+      idx_after_peak <- seq(peak_idx + 1, n)
+
+      idx_half <- idx_after_peak[
+        which.min(abs(epred[idx_after_peak] - half_val))
+      ]
+
+      VPD50 <- vpd[idx_half]
+    }
+
+    # smoothing for the relative curve
+    # so that the maximum slope is not confounded
+    
+    epred_smooth <- zoo::rollmean(
+      epred,
+      k = 5,
+      fill = "extend"
+    )
+
+    # curve standardized by its gs max
+    # so that later the slopes are comparable
+    epred_rel <- epred / gs_max
+
+    epred_rel_smooth <- zoo::rollmean(
+      epred_rel,
+      k = 5,
+      fill = "extend"
+    )
+
+    # first derivates
+
+    slope <- diff(epred_smooth) / diff(vpd)
+
+    slope_rel <- diff(epred_rel_smooth) / diff(vpd)
+
+    # midpoint slope
+    vpd_slope <- (vpd[-1] + vpd[-n]) / 2
+
+    # declining limb only
+    keep_decline <- vpd_slope >= VPD_opt
+
+    slope_after_peak     <- slope[keep_decline]
+    slope_rel_after_peak <- slope_rel[keep_decline]
+
+    vpd_after_peak <- vpd_slope[keep_decline]
+
+    # strongest decline
+    min_slope <- min(
+      slope_after_peak,
+      na.rm = TRUE
+    )
+    # make the value absolute to be able to compare it as "closure rate"
+    Sclosure <- abs(min(
+      slope_rel_after_peak,
+      na.rm = TRUE
+    ))
+
+    # output table
+
+    tibble(
+      VPD_opt      = VPD_opt,
+      gs_max      = gs_max,
+      VPD50         = VPD50,
+      Sclosure = Sclosure
+    )
+
+  })
+
+
+
+# join the old speices names
+
+stomatal_behaviour_metrics <- 
+  stomatal_behaviour_metrics %>%
+  mutate(species = case_when(species=="Pla_ace" ~ "Pla_his", 
+                            species=="Sor_dom" ~ "Cor_dom",
+                            species=="Sor_tor" ~ "Tor_gla",
+                            TRUE ~ species))
+
+
+
+# the mean of all draws per species
+
+stomatal_behaviour_species_metrics <- 
+  stomatal_behaviour_metrics %>%
+  group_by(species) %>%
+  summarise(
+
+    gs_max_l95  = quantile(gs_max, 0.025, na.rm = TRUE),
+    gs_max_u95  = quantile(gs_max, 0.975, na.rm = TRUE),
+    gs_max = mean(gs_max, na.rm = TRUE),
+    
+
+    VPD_opt_l95  = quantile(VPD_opt, 0.025, na.rm = TRUE),
+    VPD_opt_u95  = quantile(VPD_opt, 0.975, na.rm = TRUE),
+    VPD_opt = mean(VPD_opt, na.rm = TRUE),
+
+
+    VPD50_l95  = quantile(VPD50, 0.025, na.rm = TRUE),
+    VPD50_u95  = quantile(VPD50, 0.975, na.rm = TRUE),
+    VPD50 = mean(VPD50, na.rm = TRUE),
+
+
+    Sclosure_l95  = quantile(Sclosure, 0.025, na.rm = TRUE),
+    Sclosure_u95  = quantile(Sclosure, 0.975, na.rm = TRUE),
+    Sclosure = mean(Sclosure, na.rm = TRUE),
+  )
+
+# join the status conifer or broadleaved to the data
+
+tree_group_column <- data %>% dplyr::select(species, tree_group) %>% distinct()
+
+stomatal_behaviour_species_metrics <- 
+  stomatal_behaviour_species_metrics %>%
+  left_join(tree_group_column)
+
+
+
+
+write_csv(stomatal_behaviour_metrics, here::here("data", "processed", "stomatal_behaviour_metrics.csv"))
+write_csv(stomatal_behaviour_species_metrics, here::here("data", "processed", "stomatal_behaviour_species_metrics.csv"))
+
+# # reload metrics
+# stomatal_behaviour_metrics <- 
+#   read_csv(here::here("data", "processed", "stomatal_behaviour_metrics.csv")) %>% 
+#     mutate(tree_group = case_when(species == "Cor_dom" | species == "Pla_his" | species == "Tor_gla" ~ "broadleaved",
+#                                 TRUE ~ tree_group))
+# 
+# stomatal_behaviour_species_metrics <-
+#   read_csv( here::here("data", "processed", "stomatal_behaviour_species_metrics.csv")) %>% 
+#   mutate(tree_group = case_when(species == "Cor_dom" | species == "Pla_his" | species == "Tor_gla" ~ "broadleaved",
+#                                 TRUE ~ tree_group))
+
+```
+
+
+
+
+## 3.3. Metrics overview - Table S3
+```{r supplement table S3}
+
+# 1. Calculate the raw statistics and format into single cells
+metrics_formatted_table <- stomatal_behaviour_species_metrics %>%
+
+  mutate(
+    gs_max_formatted = sprintf("%.3f [%.3f, %.3f]", gs_max, gs_max_l95, gs_max_u95),
+    VPD_opt_formatted = sprintf("%.2f [%.2f, %.2f]", VPD_opt, VPD_opt_l95, VPD_opt_u95),
+    VPD50_formatted   = sprintf("%.2f [%.2f, %.2f]", VPD50, VPD50_l95, VPD50_u95),
+    Sclosure_formatted = sprintf("%.2f [%.2f, %.2f]", Sclosure, Sclosure_l95, Sclosure_u95)
+  ) %>%
+  
+  dplyr::select(
+    Species = species,
+    `gs_max (mol m-2 s-1)` = gs_max_formatted,
+    `VPD_opt (kPa)`        = VPD_opt_formatted,
+    `VPD50 (kPa)`          = VPD50_formatted,
+    `Sclosure`             = Sclosure_formatted
+  )
+
+metrics_formatted_table
+
+write_xlsx(metrics_formatted_table, here::here("output", "Tab_S3_stomatal_behaviour_species_metrics.xlsx"))
+
+```
+
+##3.4. Test gymno vs. angio
+
+```{r gymno vs. angio}
+
+# Join  the tree group onto the draw-level data
+stomatal_behaviour_metrics_with_clade <- 
+  stomatal_behaviour_metrics %>% 
+  left_join(tree_group_column)
+
+# For each draw, compute group means, then the difference
+draw_diffs <- stomatal_behaviour_metrics_with_clade %>%
+  pivot_longer(cols = c(VPD_opt, gs_max, VPD50, Sclosure),
+               names_to = "metric", values_to = "value") %>%
+  group_by(draw, metric, tree_group) %>%
+  summarise(group_mean = mean(value), .groups = "drop") %>%
+  pivot_wider(names_from = tree_group, values_from = group_mean) %>%
+  mutate(diff = gymnosperm - angiosperm)
+
+# Summarise the posterior of the difference, per metric
+diff_summary_table <- draw_diffs %>%
+  group_by(metric) %>%
+  summarise(
+    mean_diff   = mean(diff),
+    lower95     = quantile(diff, 0.025),
+    upper95     = quantile(diff, 0.975),
+    prob_positive = mean(diff > 0),          # P(angiosperm > gymnosperm)
+    prob_direction = pmax(prob_positive, 1 - prob_positive)
+  )
+
+
+
+# Figure
+# Get max absolute difference per metric, so we can build symmetric limits
+lims <- draw_diffs %>%
+  group_by(metric) %>%
+  summarise(max_abs = max(abs(diff)) * 1.05)  # 5% padding
+
+
+# Create invisible "anchor" points at +/- max_abs per metric
+#    geom_blank will use these to set symmetric x-limits per facet
+anchor_df <- lims %>%
+  tidyr::pivot_longer(max_abs, values_to = "x") %>%
+  mutate(x = list(c(-1, 1))) %>%
+  tidyr::unnest(x) %>%
+  mutate(x = x * (lims$max_abs[match(metric, lims$metric)]))
+
+
+metric_order <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
+
+metric_labels <- c(
+  gs_max   = "atop(g[max], (mol~m^{-2}~s^{-1}))",
+  VPD_opt  = "atop(VPD[opt], (kPa))",
+  VPD50    = "atop(VPD[50], (kPa))",
+  Sclosure = "atop(S[closure], (mol~m^{-2}~s^{-1}~kPa^{-1}))"
+)
+
+group_post <- draw_diffs %>%
+  dplyr::select(draw, metric, angiosperm, gymnosperm) %>%
+  pivot_longer(cols = c(angiosperm, gymnosperm),
+               names_to = "group", values_to = "value") %>%
+  mutate(
+    group = recode(group, angiosperm = "broadleaved", gymnosperm = "conifer"),
+    metric = factor(metric, levels = metric_order)
+  )
+
+# Build significance summary per metric (from draw_diffs, computed earlier) --
+sig_table <- draw_diffs %>%
+  group_by(metric) %>%
+  summarise(
+    mean_diff = mean(diff),
+    lower95   = quantile(diff, 0.025),
+    upper95   = quantile(diff, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sig_label = if_else(lower95 > 0 | upper95 < 0, "*", ""),
+    label_text = sprintf("Δ = %.2f [%.2f, %.2f] %s",
+                          mean_diff, lower95, upper95, sig_label))
+    
+label_pos <- group_post %>%
+  group_by(metric) %>%
+  summarise(x_pos = mean(range(value)), .groups = "drop") %>%
+  left_join(sig_table, by = "metric") %>%
+  mutate(metric = factor(metric, levels = metric_order))
+
+
+fig_metric_diff_tree_group <- ggplot(group_post, aes(x = value, fill = group)) +
+  geom_histogram(position = "identity", bins = 60, alpha = 0.5, color = NA) +
+  geom_text(data = label_pos,
+            aes(x = x_pos, y = Inf, label = label_text),
+            inherit.aes = FALSE,
+            vjust = 1.5, size = 3.2, fontface = "bold") +
+  facet_wrap(~ metric, scales = "free", nrow = 1,
+             labeller = as_labeller(metric_labels, label_parsed)) +
+  scale_fill_manual(values = c(broadleaved = "#41624D", conifer = "#7798B9")) +
+  labs(x = "Posterior group mean", y = "Count", fill = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom", 
+        strip.text = element_text(face = "bold"))
+
+```
+
+
+# 4. Figures (Main)
+
+## 4.1. Fig. 1ab - Modeling example
+
+```{r figures example Sor_auc}
+
+# Just choose one example species, here Sorbus aucuparia
+example_species <- "Sor_auc"
+data_target <- data %>% filter(species == example_species)
+
+set.seed(321) # Ensure consistency with your previous draws
+
+
+nd_full <- create_prediction_grid(example_species, VPD_grid_plot)
+draws_df <- predict_posterior_curves(example_species, nd_full, model, ndraws = 300)
+mean_df  <- predict_mean_curve(example_species, nd_full, model)
+
+p_full <- ggplot() +
+  geom_point(
+    data = data_target,
+    aes(VPDleaf, gsw),
+    alpha = 0.2,
+    size = 1.6
+  ) +
+geom_line(
+    data = draws_df, 
+    aes(VPD, gsw, group = draw), 
+    alpha = 0.2,
+    linewidth = 0.25,
+    color = "grey"
+  ) +
+  geom_line(
+    data = mean_df,
+    aes(VPD, gsw_mean),
+    linewidth = 1.2
+  ) +
+  labs(
+    x = expression("Leaf-to-air Vapor Pressure Deficit, VPD"["L"] * " (kPa)"),
+    y = expression("Stomatal Conductance, g"["s"] * " (mol m"^-2 * " s"^-1 * ")")
+  ) +
+  ylim(0,0.61) +
+  theme_classic(base_size=18)
+
+
+# Figure on the leaf_id level
+
+nd_leaf <- create_prediction_grid_leaf(example_species, VPD_grid_plot, data_target)
+mean_df_leaf <- predict_leaf_curves(nd_leaf, model, ndraws = 50)
+
+data_target <- data_target %>%
+  group_by(tree_id) %>%
+  mutate(leaf_index = as.factor(match(leaf_id, unique(leaf_id)))) %>%
+  ungroup()
+
+mean_df_leaf <- mean_df_leaf %>%
+  group_by(tree_id) %>%
+  mutate(leaf_index = as.factor(match(leaf_id, unique(leaf_id)))) %>%
+  ungroup()
+
+
+p_leaf <- ggplot() +
+  geom_point(
+    data = data_target,
+    aes(VPDleaf, gsw, colour = tree_id, alpha = leaf_index),
+    size = 1.6
+  ) +
+  geom_line(
+    data = mean_df_leaf,
+    aes(VPD, gsw, group = leaf_id, color = tree_id, alpha=leaf_index),
+    linewidth = 0.4
+  ) +
+  scale_color_manual(values = pastel,
+                     name = "Tree Individual",
+                     labels = c("1", "2", "3")) +
+  scale_alpha_manual(
+    values = c(
+  "1" = 0.25, 
+  "2" = 0.35, 
+  "3" = 0.48, 
+  "4" = 0.60, 
+  "5" = 0.73, 
+  "6" = 0.85, 
+  "7" = 1.00
+),
+    name = "Leaf Individual",
+    labels = paste(1:7)
+  ) +
+  labs(
+    x = expression("Leaf-to-air Vapor Pressure Deficit, VPD"["L"] * " (kPa)"),
+    y = expression("Stomatal Conductance, g"["s"] * " (mol m"^-2 * " s"^-1 * ")")
+  ) +
+  xlim(0, 6) +
+    ylim(0,0.61) +
+  theme_classic(base_size=18) +
+theme(
+    # Move the legend inside the plot area 
+    legend.position = c(0.98, 0.82),
+    # Anchor the legend box by its top-right corner
+    legend.justification = c(1, 1),  
+
+    legend.background = element_rect(fill = "transparent", color = NA),
+    legend.box.background = element_rect(fill = "transparent", color = NA),
+
+    legend.title = element_text(face = "bold", size = 9),
+    legend.text = element_text(size = 8),
+    legend.spacing.y = unit(0.1, "cm"),
+    
+    legend.key.size = unit(0.4, "cm") 
+  )
+
+
+combined_plot <- (p_full + p_leaf) + 
+  plot_annotation(
+    tag_levels = list(c("(a)", "(b)"))
+  ) & 
+  theme(
+    plot.tag = element_text(face = "bold", size = 12)
+  )
+# 
+# 
+# ggsave(
+#   filename = here::here(
+#     "output",
+#     "Fig_1_model_fit_example.png"
+#   ),
+#   plot = combined_plot,
+#   width = 9,
+#   height = 5,
+#   dpi = 300
+# )
+# 
+# 
+# # save for submission
+# ggsave(
+#   filename = here::here(
+#     "output",
+#     "Figure_1.pdf"
+#   ),
+#   plot = combined_plot,
+#   width = 9,
+#   height = 5,
+#   dpi = 1000
+# )
+
+
+```
+
+## 4.2. Fig. 1c - Extraction of metrics
+
+```{r figure metric extraction}
+
+# Metrics are extracted here from the posterior mean curve only
+# to illustrate the calculation procedure.
+# Quantitative analyses use posterior distributions from stomatal_behaviour_metrics.
+
+species_df <- posterior_means %>% filter(species == example_species)
+
+# Find the peak directly on the black line plotted
+gs_max_val <- max(species_df$gsw_mean, na.rm = TRUE)
+vpd_opt    <- species_df$VPD[which.max(species_df$gsw_mean)]
+
+# Find the 50% drop directly on the black line plotted
+gs_50_val    <- gs_max_val * 0.50
+post_peak_df <- species_df %>% filter(VPD >= vpd_opt)
+vpd_50       <- post_peak_df$VPD[which.min(abs(post_peak_df$gsw_mean - gs_50_val))]
+
+# Calculate the absolute slope geometry for the tangent line
+abs_slopes    <- diff(post_peak_df$gsw_mean) / diff(post_peak_df$VPD)
+min_slope_idx <- which.min(abs_slopes)
+
+m_slope_abs   <- abs_slopes[min_slope_idx]
+vpd_Sclosure  <- post_peak_df$VPD[min_slope_idx]
+gs_Sclosure   <- post_peak_df$gsw_mean[min_slope_idx]
+intercept_val <- gs_Sclosure - (m_slope_abs * vpd_Sclosure)
+
+
+
+fig_extraction_method <- 
+  ggplot(species_df, aes(VPD, gsw_mean)) +
+  geom_line(linewidth = 1.1, color = "black") +
+  geom_abline(intercept = intercept_val, slope = m_slope_abs, color = "#059669", 
+              linetype = "solid", linewidth = 0.8) +
+  geom_segment(aes(x = vpd_opt, y = 0, xend = vpd_opt, yend = gs_max_val), 
+               linetype = "dashed", color = "#9333EA") +
+  geom_segment(aes(x = 0, y = gs_max_val, xend = vpd_opt, yend = gs_max_val), 
+               linetype = "dashed", color = "#3B5277") +
+  geom_segment(aes(x = 0, y = gs_50_val, xend = vpd_50, yend = gs_50_val), 
+               linetype = "twodash", color = "#C2410C") +
+  geom_segment(aes(x = vpd_50, y = 0, xend = vpd_50, yend = gs_50_val), 
+               linetype = "twodash", color = "#C2410C") +
+  annotate("text", x = 0.1, y = gs_max_val * 1.03, 
+           label = "bold(g)[bold(max)]", parse = TRUE, hjust = 0, colour = "#3B5277") +
+  annotate("text", x = vpd_opt, y = gs_max_val * 0.10, 
+           label = "bold(VPD)[bold(opt)]", parse = TRUE, vjust = -0.5, angle = 90, colour = "#9333EA") +
+  annotate("text", x = vpd_50, y = gs_max_val * 0.10, 
+           label = "bold(VPD)[bold(50)]", parse = TRUE, vjust = -0.5, angle = 90, color = "#C2410C") +
+  annotate("text", x = vpd_Sclosure + 0.2, y = gs_Sclosure + 0.02, 
+           label = "bold(S)[bold(closure)]", parse = TRUE, color = "#059669") +
+
+  labs(
+    x = expression("Leaf-to-air Vapor Pressure Deficit, VPD"["L"] * " (kPa)"),
+    y = expression("Stomatal Conductance, g"["s"] * " (mol m"^-2 * " s"^-1 * ")")
+  ) +
+  
+  scale_x_continuous(expand = c(0, 0), limits = c(0, max(species_df$VPD) * 1.05)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, gs_max_val * 1.1)) +
+  theme_classic(base_size=18)
+
+fig_extraction_method
+
+# ggsave(
+#   filename = here::here(
+#     "output",
+#     "Fig_2_extraction_method.png"
+#   ),
+#   plot = fig_extraction_method,
+#   width = 8,
+#   height = 6,
+#   dpi = 300
+# )
+# 
+# # figure for submission
+# ggsave(
+#   filename = here::here(
+#     "output",
+#     "Figure_2.pdf"
+#   ),
+#   plot = fig_extraction_method,
+#   width = 8,
+#   height = 6,
+#   dpi = 1000
+# )
+
+combined_fig_1abc <- (p_full + p_leaf) / fig_extraction_method +
+  plot_layout(heights = c(1, 1.3)) +  # give more vertical room to panel c if needed
+  plot_layout(widths =  c(1.3, 1)) +
+  plot_annotation(
+    tag_levels = list(c("(a)", "(b)", "(c)"))
+  ) &
+  theme(
+    plot.tag = element_text(face = "bold", size = 18)
+  )
+
+ggsave(
+  filename = here::here("output", "Figure_1abc.png"),
+  plot = combined_fig_1abc,
+  width = 14, height = 13, dpi = 300
+)
+
+ggsave(
+  filename = here::here("output", "Figure_1.pdf"),
+  plot = combined_fig_1abc,
+  width = 14, height = 13, dpi = 1000
+)
+
+```
+
+
+
+
+## 4.3. Fig. 3 - Stomatal response curves
+```{r curves of all species}
+
+# Use posterior mean predictions generated in Section 2.2.
+# These represent population-level curves without tree/leaf random effects.
+curves_all <- posterior_means %>%
+  left_join(
+    data %>% select(species, tree_group) %>% distinct(),
+    by = "species"
+  ) %>%
+# and add the new names!
+     mutate(species = case_when(species=="Pla_ace" ~ "Pla_his", 
+                            species=="Sor_dom" ~ "Cor_dom",
+                            species=="Sor_tor" ~ "Tor_gla",
+                            TRUE ~ species))
+
+label_df <- curves_all %>%
+  group_by(species) %>%
+  slice_max(gsw_mean, n = 1) %>%
+  ungroup()
+
+# Classify species into low, intermediate, and high VPD optimum groups
+# based on tertiles of the estimated VPD optimum.
+quantiles <- quantile(stomatal_behaviour_species_metrics$VPD_opt, probs = c(1/3, 2/3), na.rm = TRUE)
+
+
+species_groups_optimum <- stomatal_behaviour_species_metrics %>%
+  mutate(optimum_group = case_when(
+    VPD_opt >= quantiles[2] ~ "High VPD Optimum (VPD<sub>L</sub>>1)",
+    VPD_opt < quantiles[2] & VPD_opt >= quantiles[1] ~ "Mid VPD Optimum (VPD<sub>L</sub>~1)",
+    VPD_opt < quantiles[1] ~ "Low VPD Optimum (VPD<sub>L</sub><1)"
+  )) %>%
+  mutate(optimum_group = factor(optimum_group, levels = c(
+    "Low VPD Optimum (VPD<sub>L</sub><1)",
+    "Mid VPD Optimum (VPD<sub>L</sub>~1)",
+    "High VPD Optimum (VPD<sub>L</sub>>1)"
+  )))
+
+
+# Add VPD optimum classification to the curve data for faceting
+curves_vpd_grouped <- curves_all %>% 
+  left_join(species_groups_optimum %>% 
+              dplyr::select(species, optimum_group), by = "species")
+
+# Generate species-specific colour gradients within each VPD optimum group.
+
+group_counts <- species_groups_optimum %>% count(optimum_group)
+
+n_high <- group_counts %>% filter(optimum_group == "High VPD Optimum (VPD<sub>L</sub>>1)") %>% pull(n)
+n_mid  <- group_counts %>% filter(optimum_group == "Mid VPD Optimum (VPD<sub>L</sub>~1)")  %>% pull(n)
+n_low  <- group_counts %>% filter(optimum_group == "Low VPD Optimum (VPD<sub>L</sub><1)")  %>% pull(n)
+
+low_base  <- c("#EAB308", "#CA8A04", "#A16207", "#854D0E", "#713F12")
+mid_base  <- c("#F97316", "#EA580C", "#C2410C", "#9A3412", "#7C2D12")
+high_base <- c("#EF4444", "#DC2626", "#B91C1C", "#991B1B", "#450A0A")
+
+colors_high <- colorRampPalette(high_base)(n_high)
+colors_mid  <- colorRampPalette(mid_base)(n_mid)
+colors_low  <- colorRampPalette(low_base)(n_low)
+
+species_color_mapping <- species_groups_optimum %>%
+  arrange(optimum_group, species) %>%
+  group_by(optimum_group) %>%
+  mutate(species_color = case_when(
+    optimum_group == "High VPD Optimum (VPD<sub>L</sub>>1)" ~ colorRampPalette(high_base)(n()),
+    optimum_group == "Mid VPD Optimum (VPD<sub>L</sub>~1)"  ~ colorRampPalette(mid_base)(n()),
+    optimum_group == "Low VPD Optimum (VPD<sub>L</sub><1)"  ~ colorRampPalette(low_base)(n())
+  )) %>%
+  ungroup()
+
+custom_colors <- species_color_mapping$species_color
+names(custom_colors) <- species_color_mapping$species
+
+# Determine curve peaks as label anchor points.
+# Labels are subsequently displaced vertically to avoid overlap.
+label_df_peak <- curves_vpd_grouped %>%
+  group_by(species, optimum_group) %>%
+  slice_max(gsw_mean, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  arrange(optimum_group, desc(gsw_mean)) %>%
+  group_by(optimum_group) %>%
+  mutate(
+    x_label = VPD + 0.3,
+    y_label = gsw_mean
+  )
+
+min_gap <- 0.02
+
+label_df_peak <- label_df_peak %>%
+  arrange(optimum_group, desc(y_label)) %>%
+  group_by(optimum_group) %>%
+  mutate(
+    y_label = accumulate(
+      y_label,
+      ~ {
+        if (.y > .x - min_gap) {
+          .x - min_gap
+        } else {
+          .y
+        }
+      }
+    )
+  ) %>%
+  mutate(
+    displacement = abs(y_label - gsw_mean),
+    x_label = VPD + 0.15 + 4 * displacement
+  )
+
+# Calculate the min and max VPD_opt for each facet panel
+bg_rects <- species_groups_optimum %>%
+  group_by(optimum_group) %>%
+  summarise(
+    xmin = min(VPD_opt, na.rm = TRUE),
+    xmax = max(VPD_opt, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  # Inf and -Inf map to the bottom and top boundaries of the panel automatically
+  mutate(
+    ymin = -Inf,
+    ymax = Inf
+  )
+
+# Plot population-level stomatal response curves grouped by VPD optimum.
+# Curves show predicted stomatal conductance responses across the VPD gradient.
+p_vpd_grouped <- 
+  ggplot(curves_vpd_grouped, 
+         aes(x = VPD, y = gsw_mean, colour = species)) +
+  
+  geom_rect(
+    data = bg_rects,
+    aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+    fill = "gray70",      
+    alpha = 0.5,          
+    inherit.aes = FALSE
+  ) +
+ 
+  geom_line(linewidth = 0.8, alpha = 0.85) +
+  
+  geom_segment(
+    data = label_df_peak,
+    aes(
+    x = VPD,
+    y = gsw_mean,
+    xend = x_label,
+    yend = y_label,
+    colour = species),
+    linewidth = 0.3
+    ) +
+  geom_label(
+    data = label_df_peak,
+    aes(
+    x = x_label,
+    y = y_label,
+    label = species,
+    colour = species),
+    hjust = 0,
+    size = 3.6,
+    fill = alpha("white", 0.6),
+    linewidth = NA,
+    label.padding = unit(0.1, "lines")
+    ) +
+  
+  facet_wrap(~optimum_group, ncol = 3) +
+  
+  scale_colour_manual(
+    values = custom_colors, 
+    guide = "none"
+    ) +
+  labs(
+    x = expression("Vapor Pressure Deficit, VPD"["L"] * " (kPa)"),
+    y = expression("Stomatal Conductance, g"["s"] * " (mol m"^-2 * " s"^-1 * ")")
+    ) +
+  coord_cartesian(clip = "off") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme(
+    plot.margin = margin(5.5, 60, 5.5, 5.5)
+    ) +
+  theme_bw(base_size=20) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = ggtext::element_markdown(face = "bold", size = 16, hjust = 0),
+    panel.grid = element_blank()
+  )
+
+p_vpd_grouped
+
+ggsave(
+  here::here("output", "Fig_3_all_curves.png"),
+  p_vpd_grouped,
+  width = 11,
+  height = 8.5, 
+  dpi = 300
+)
+
+
+# save for submission
+ggsave(
+  here::here("output", "Figure_3.pdf"),
+  p_vpd_grouped,
+  width = 11,
+  height = 8.5, 
+  dpi = 1000
+)
+
+```
+
+
+## 4.4. Fig. 4 - Stomatal Behaviour Metrics
+
+```{r figure 4 - all metrics in one space}
+
+stomatal_behaviour_species_metrics <- 
+  stomatal_behaviour_species_metrics %>%
+  dplyr::select(-c(tree_group)) %>% 
+  left_join(tree_group_column)
+
+# Plot ranges and scaling
+
+x_limits <- range(stomatal_behaviour_species_metrics$VPD_opt, na.rm = TRUE)
+y_limits <- range(stomatal_behaviour_species_metrics$gs_max, na.rm = TRUE)
+
+x_span <- diff(x_limits)
+y_span <- diff(y_limits)
+
+x_offset <- 0.05 * x_span
+y_offset <- 0.05 * y_span
+
+
+# plot geometry
+plot_width <- 9
+plot_height <- 6
+
+
+# Create custom point symbols
+#
+# Each species is represented by a circle:
+#   - outline colour = VPD50
+#   - fill encodes stomatal closure rate (Sclosure):
+#       shallow  -> empty circle
+#       moderate -> half-filled circle
+#       steep    -> filled circle
+#
+# Since ggplot does not provide half-filled points with independent outline
+# and fill colours, the symbols are constructed manually from polygons.
+
+circle_pts <- function(x0, y0, rx, ry, from = 0, to = 2*pi, n = 60) {
+  th <- seq(from, to, length.out = n)
+  data.frame(x = x0 + rx * cos(th), y = y0 + ry * sin(th))
+}
+
+aspect_correction <- 0.75   # tune up/down until circles look round
+
+rx <- x_span * 0.009        # smaller base size (was 0.012)
+ry <- rx * aspect_correction * (plot_width * y_span) / (x_span * plot_height)
+
+# create 3 groups of the variable Sclosure
+stomatal_behaviour_species_metrics <- 
+  stomatal_behaviour_species_metrics %>% 
+    mutate(
+    Sclosure_group = ntile(Sclosure, 3),
+    Sclosure_group = factor(
+      Sclosure_group,
+      levels = c(1, 2, 3),
+      labels = c("shallow", "moderate", "steep")
+    )
+  )
+
+
+# outline: always a full circle, for every point
+point_outline <- stomatal_behaviour_species_metrics %>%
+  filter(!is.na(Sclosure_group)) %>%
+  mutate(point_id = row_number()) %>%
+  group_by(point_id) %>%
+  group_modify(~ {
+    d <- .x
+    coords <- circle_pts(d$VPD_opt, d$gs_max, rx, ry)
+    coords$VPD50 <- d$VPD50
+    coords
+  }) %>%
+  ungroup()
+
+
+
+
+# fill: empty (shallow, skip), half-disc (moderate), full disc (steep)
+point_fill <- stomatal_behaviour_species_metrics %>%
+  filter(Sclosure_group %in% c("moderate", "steep")) %>%
+  mutate(point_id = row_number()) %>%
+  group_by(point_id) %>%
+  group_modify(~ {
+    d <- .x
+    coords <- if (d$Sclosure_group == "steep") {
+      circle_pts(d$VPD_opt, d$gs_max, rx, ry)               # full disc
+    } else {
+rbind(
+  circle_pts(d$VPD_opt, d$gs_max, rx, ry, from = pi, to = 2*pi),  # now lower half
+  data.frame(x = d$VPD_opt, y = d$gs_max)
+)
+    }
+    coords$VPD50 <- d$VPD50
+    coords
+  }) %>%
+  ungroup()
+
+
+
+
+vpd50_range <- range(stomatal_behaviour_species_metrics$VPD50, na.rm = TRUE)
+
+# Midpoints of the plotting range used to divide the trait space
+# into four conceptual quadrants.
+mid_VPDopt <- mean(range(stomatal_behaviour_species_metrics$VPD_opt, na.rm = TRUE))
+mid_gs <- mean(range(stomatal_behaviour_species_metrics$gs_max, na.rm = TRUE))
+
+
+# Positions and alignment of the four quadrant labels.
+# The labels are positioned slightly outside the data range so that
+# left labels start at the left edge and right labels end at the right edge.
+quad_labels <- tibble::tibble(
+  label = c(
+    "High-capacity\nearly-peaking",
+    "High-capacity\nlate-peaking",
+    "Low-capacity\nearly-peaking",
+    "Low-capacity\nlate-peaking"
+  ),
+  
+x = c(
+  x_limits[1] - x_offset,
+  x_limits[2] + x_offset,
+  x_limits[1] - x_offset,
+  x_limits[2] + x_offset
+),
+  
+y = c(
+  y_limits[2] + y_offset,
+  y_limits[2] + y_offset,
+  y_limits[1] - y_offset,
+  y_limits[1] - y_offset
+),
+  
+  hjust = c(0, 1, 0, 1),
+  vjust = c(1, 1, 0, 0)
+)
+
+# create the figure
+fig_all_metrics <- stomatal_behaviour_species_metrics %>%
+  ggplot(aes(VPD_opt, gs_max)) +
+  geom_vline(xintercept = mid_VPDopt, colour = "grey60", linewidth = 0.4, linetype = "dotted") +
+  geom_hline(yintercept = mid_gs,  colour = "grey60", linewidth = 0.4, linetype = "dotted") +
+  geom_text(data = quad_labels,
+            aes(x=x, y=y, label = label, hjust = hjust, vjust = vjust),
+            size = 5, fontface = "italic", colour = "grey35", lineheight = 0.9) +
+
+  geom_polygon(data = point_fill, aes(x, y, group = point_id, fill = VPD50)) +
+  geom_path(data = point_outline, aes(x, y, group = point_id, colour = VPD50),
+            linewidth = 1) +
+
+scale_fill_viridis_c(
+  option = "magma", direction = -1, end = 0.9,
+  limits = vpd50_range,
+  guide = "none"
+) +
+scale_colour_viridis_c(
+  name   = expression(atop("VPD at half-closure:", "" * VPD[50] * " (kPa)")),
+  option = "magma", direction = -1, end = 0.9,
+  limits = vpd50_range,
+  guide  = guide_colorbar(order = 1, title.position = "top", title.hjust = 0.5)
+) +
+geom_point(data = stomatal_behaviour_species_metrics,
+           aes(x = VPD_opt, y = gs_max, shape = Sclosure_group),
+           colour = "black", fill = "black", size = 4,
+           alpha = 0, inherit.aes = FALSE) +
+
+scale_shape_manual(
+  name   = expression(atop("Closure rate:", "" * S[closure] * "")),
+  values = c("shallow" = 21, "moderate" = 21, "steep" = 21),
+  guide  = guide_legend(order = 2, title.position = "top", title.hjust = 0.5,
+                         override.aes = list(size = 3, alpha = 0))
+) +
+  new_scale_colour() +
+  
+  geom_text_repel(aes(
+                  label = species, 
+                  colour = tree_group, 
+                  segment.colour=tree_group),
+                  fontface="italic",
+                  size = 3.5,
+                  max.overlaps = Inf,
+                  force = 2, force_pull = 0.5,
+                  nudge_x = 0.01, nudge_y = 0.01,
+                  box.padding = 0.3, point.padding = 0.1,
+                  min.segment.length = 0.3,
+                  segment.size = 0.3, seed = 42) +
+  scale_colour_manual(
+    name = "Tree group",
+    aesthetics = c("colour", "segment.colour"),
+    values = c("broadleaved" = "black", "conifer" = "grey50"),
+    guide= "none"
+    # guide = guide_legend(order = 3, title.position = "top", title.hjust = 0.5)
+  ) +
+
+  scale_x_continuous(
+    name = expression("VPD optimum (VPD"[opt]*", kPa)")) +
+  scale_y_continuous(
+    name = expression("Maximum "*italic(g)[s]*" ("*italic(g)[max]*", mol m"^{-2}*" s"^{-1}*")")) +
+  
+  theme_classic(base_size = 11) +
+  theme(
+    legend.position = "right",
+    legend.key.size = unit(0.5, "cm"),
+    legend.title    = element_text(size = 14, hjust = 0.5),
+    legend.text     = element_text(size = 12),
+    axis.title      = element_text(size=16),
+    axis.line       = element_line(colour = "grey40"),
+    panel.border    = element_rect(colour = "grey40", fill = NA),
+    plot.margin     = margin(20, 20, 10, 10)
+  )
+
+ggsave(here("output", "Fig_all_metrics.png"), fig_all_metrics, height=6, width=9.5, dpi=300)
+
+ggsave(here("output", "Fig_all_metrics.svg"), fig_all_metrics, height=6, width=9.5, dpi=1000)
+
+```
+
+
+
+
+# 5. Figures (Supplementary)
+## 5.1. Fig. S6 - Prior predictive check
+
+```{r prior check}
+
+baseline <- create_prediction_grid(
+  sp = species_list[1],
+  VPD_grid = VPD_grid_plot
+)
+
+# Extract predictor draws
+prior_samples_grid <- posterior_epred(
+  model_check_priors,
+  newdata = baseline,
+  transform = TRUE,
+  re_formula = NA  
+)
+
+# Sample 100 draws and format for ggplot
+set.seed(123)
+draw_indices <- sample(1:nrow(prior_samples_grid), 100)
+pp_curves_sampled <- prior_samples_grid[draw_indices, ]
+
+# Convert the matrix to a long-format data frame for ggplot
+plot_data <- as.data.frame(t(pp_curves_sampled)) %>%
+  mutate(VPDleaf = VPD_grid_plot) %>%
+  pivot_longer(
+    cols = -VPDleaf, 
+    names_to = "draw", 
+    values_to = "gsw"
+  )
+
+fig_prior_predictive <- ggplot(plot_data, aes(x = VPDleaf, y = gsw, group = draw)) +
+  geom_line(alpha = 0.3, color = "royalblue", linewidth = 0.5) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(expand = c(0, 0)) + 
+  labs(
+    x = expression(Vapor~Pressure~Deficit~(VPD[L]*", kPa")), # Added typical units
+    y = expression(Stomatal~Conductance~(italic(g)[s]*", mol "~m^{-2}~s^{-1}))
+  ) +
+  theme_minimal(base_size = 11) + 
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(face = "plain")
+  )
+
+ggsave(here("output", "Fig_S6_Priors.png"), fig_prior_predictive, dpi=300, height=5, width=7)
+
+```
+
+
+## 5.2. Fig. S7 - Curves of single species
+```{r single species curve}
+
+# Create the single faceted plot
+facet_plot <- ggplot() +
+  
+  geom_point(data = data, aes(VPDleaf, gsw, colour=as.factor(tree_individual)), alpha = 0.4, size = 0.6) +
+  
+  
+  geom_line(data = posterior_draws, aes(VPD, gsw, group = draw), alpha = 0.15, linewidth = 0.3, color = "grey70") +
+  geom_line(data = posterior_means, aes(VPD, gsw_mean), linewidth = 1.0, color = "black") +
+  
+  facet_wrap(~species, ncol = 5, scales = "free_y") +
+  scale_color_manual(values = pastel) +
+  labs(
+    x = expression("VPD"["L"] * " (kPa)"),
+    y = expression("g"["s"] * " (mol m"^-2 * " s"^-1 * ")")
+  ) +
+  theme_classic() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "italic", size = 9),
+    axis.title = element_text(size = 10),
+    axis.text = element_text(size = 8)
+  )
+
+ggsave(
+  filename = here::here("output", "Fig_S7_species_curves.png"),
+  plot = facet_plot,
+  width = 6.5,
+  height = 9,
+  dpi = 300
+)
+
+```
+
+
+
+
+##5.3. Fig. S8 - Gymno vs. Angio
+
+```{r fig metrics gymno vs. angio}
+
+fig_metric_diff_tree_group
+
+ggsave(
+  filename = here::here(
+    "output",
+    "Fig_SX_clade_differences_in_metrics.png"
+  ),
+  plot = fig_metric_diff_tree_group,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+
+```
+
+## 5.4. Fig. S9 - Metrics correlation
+
+```{r correlation matrix}
+
+correlation_metrics_data <- stomatal_behaviour_species_metrics %>%
+  dplyr::select(gs_max, VPD_opt, VPD50, Sclosure)
+
+res <- Hmisc::rcorr(
+  as.matrix(correlation_metrics_data),
+  type = "pearson"
+)
+
+cor_long <- as.data.frame(as.table(res$r)) %>%
+  rename(Var1 = Var1, Var2 = Var2, correlation = Freq)
+
+p_long <- as.data.frame(as.table(res$P)) %>%
+  rename(Var1 = Var1, Var2 = Var2, p_value = Freq)
+
+plot_data <- left_join(cor_long, p_long, by = c("Var1", "Var2")) %>%
+  mutate(
+    sig_label = case_when(
+      p_value < 0.001 ~ "***",
+      p_value < 0.01  ~ "**",
+      p_value < 0.05  ~ "*",
+      p_value < 0.1   ~ ".",
+      TRUE ~ ""
+    )
+  )
+
+diagonal_data <- plot_data %>% filter(Var1 == Var2)
+
+var_labels <- c(
+  gs_max   = expression(g[max]),
+  VPD_opt  = expression(VPD[opt]),
+  VPD50    = expression(VPD[50]),
+  Sclosure = expression(S[closure])
+)
+
+fig_corr_metrics <- ggplot(plot_data, aes(x = Var2, y = Var1, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_tile(data = diagonal_data, fill = "grey40", color = "white") +  # grey diagonal
+  geom_text(aes(label = paste0(round(correlation, 2))),
+            color = "white", size = 4, lineheight = 0.9) +
+  scale_fill_gradient2(
+    low = "#d6604d", mid = "grey90", high = "#2166ac",
+    midpoint = 0, limits = c(-1, 1),
+    name = "Pearson r"
+  ) +
+  scale_x_discrete(labels = var_labels) +
+  scale_y_discrete(labels = var_labels) +
+  theme_minimal() +
+  theme(
+    axis.text = element_text(size = 11),
+    axis.title = element_blank(),
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  coord_fixed()
+
+fig_corr_metrics
+
+ggsave(here("output", "Fig_S8_correlation_metrics.png"), fig_corr_metrics, height=6, width=9)
+
+```
+
+## 5.5. Fig. S10 - Coordination of metrics
+```{r coordination of metrics}
+
+# Prepare species-level metric matrix for PCA
+# Species become row names because prcomp() expects observations in rows.
+data_pca <- stomatal_behaviour_species_metrics %>%
+  dplyr::select(
+    species,
+    gs_max, 
+    VPD_opt,
+    VPD50, 
+    Sclosure
+  ) %>%
+  column_to_rownames("species")
+
+
+
+# Run PCA on standardized variables
+# Scaling ensures that all metrics contribute equally despite different units.
+pca_res <- prcomp(data_pca, center = TRUE, scale. = TRUE)
+
+# Extract PCA scores (species positions) for plotting
+ind_coords <- as.data.frame(pca_res$x) %>%
+  rownames_to_column("species") %>%
+  left_join(tree_group_column, by = "species")
+
+# Extract PCA loadings (metric vectors)
+var_coords <- as.data.frame(pca_res$rotation)
+var_coords$var_names <- rownames(var_coords)
+
+# Vector length in the PC1-PC2 plane.
+# Used to scale arrow linewidths if desired.
+var_coords$contrib <- sqrt(var_coords$PC1^2 + var_coords$PC2^2)
+
+# Scale loading vectors to fit into the same coordinate system
+# as the species scores for visualization.
+scale_factor <- min(
+  diff(range(ind_coords$PC1)) / diff(range(var_coords$PC1)),
+  diff(range(ind_coords$PC2)) / diff(range(var_coords$PC2))
+) * 0.7
+
+var_coords$PC1_s <- var_coords$PC1 * scale_factor
+var_coords$PC2_s <- var_coords$PC2 * scale_factor
+
+
+# Position labels slightly beyond the arrow tips
+# so they do not overlap with the arrowheads.
+var_coords$angle <- atan2(var_coords$PC2_s, var_coords$PC1_s)
+offset <- 0.06 * max(abs(c(var_coords$PC1_s, var_coords$PC2_s)))
+
+var_coords$x_lab <- var_coords$PC1_s + offset * cos(var_coords$angle)
+var_coords$y_lab <- var_coords$PC2_s + offset * sin(var_coords$angle)
+
+# Expressions parsed by ggplot to format subscripts and italics.
+var_coords$var_label <- c(
+  gs_max   = "bolditalic(g)[s*' max']",
+  VPD_opt  = "bold(VPD)[opt]",
+  VPD50    = "bold(VPD)[50]",
+  Sclosure = "bold(S)[closure]"
+)[var_coords$var_names]
+
+
+# Percentage of variance explained by each principal component
+# for axis labels.
+pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
+
+pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
+pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
+
+# PCA biplot 
+pca_metrics <- 
+  
+  ggplot(ind_coords, aes(PC1, PC2)) +
+
+  geom_point(
+    aes(shape = tree_group, colour=tree_group),
+    size = 3.5,
+    alpha = 0.9
+    ) +
+  geom_segment(
+  data = var_coords,
+  aes(
+    x = 0, y = 0,
+    xend = PC1_s,
+    yend = PC2_s
+  ),
+  arrow = arrow(length = unit(0.22, "cm")),
+  color = "black",
+  alpha = 0.9
+  ) +
+  geom_label_repel(
+    data = var_coords,
+    aes(x = PC1_s, y = PC2_s, label = var_label),
+    parse = TRUE,
+
+  fill = scales::alpha("white", 0.7),
+
+  label.size = NA,      # <- removes border completely
+  label.padding = unit(0.15, "lines"),
+
+  box.padding = 0.3,
+  point.padding = 0.2,
+  segment.color = NA,
+
+  size = 3.5,
+  fontface = "bold"
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.4) +
+
+  coord_fixed(ratio = 1) +
+  
+    scale_color_manual(
+      values = c("broadleaved" = "#41624D", "conifer" = "#7798B9"),
+      name= "Tree group") +
+
+  scale_shape_manual(
+    values = c(
+      "broadleaved" = 16,
+      "conifer" = 17
+    ),
+    name = "Tree group"
+  ) +
+
+  labs(
+    x = pc1_lab,
+    y = pc2_lab,
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  )
+
+pca_metrics
+
+ggsave(
+  filename = here::here("output", "Fig_S10_Coordination_metrics.png"),
+  plot = pca_metrics,
+  width = 7,
+  height = 4,
+  dpi = 300
+)
+
+
+# test of how many axes I would need
+
+pa <- psych::fa.parallel(
+  data_pca,
+  fa = "pc",
+  n.iter = 1000,
+  show.legend = TRUE
+)
+pa$ncomp  # number of components to retain
+
+
+
+r2_unique <- sapply(names(data_pca), function(v) {
+  f <- as.formula(paste(v, "~ ."))
+  summary(lm(f, data = data_pca))$r.squared
+})
+r2_unique
+
+
+library(car)
+vif(lm(gs_max ~ VPD_opt + VPD50 + Sclosure, data = data_pca))
+
+```
+## 5.6. Fig. S11 - Overview of Metrics
+
+```{r metrics figure}
+
+species_order <- stomatal_behaviour_species_metrics %>%
+  arrange(gs_max) %>% 
+  pull(species)
+
+metrics_long <- stomatal_behaviour_species_metrics %>%
+  rename(
+    gs_mean       = gs_max,
+    VPD_mean      = VPD_opt,
+    VPD50_mean    = VPD50,
+    Sclosure_mean = Sclosure
+  ) %>%
+  dplyr::select(
+    species, 
+    tree_group, 
+    gs_mean, gs_l95 = gs_max_l95, gs_u95 = gs_max_u95,
+    VPD_mean, VPD_l95 = VPD_opt_l95, VPD_u95 = VPD_opt_u95,
+    VPD50_mean, VPD50_l95, VPD50_u95,
+    Sclosure_mean, Sclosure_l95, Sclosure_u95
+  ) %>%
+  pivot_longer(
+    cols = -c(species, tree_group), 
+    names_to = c("metric", ".value"),
+    names_sep = "_"
+  ) %>%
+  mutate(
+    metric = factor(metric, 
+                    levels = c("gs", "VPD", "VPD50", "Sclosure"),
+                    labels = c("gs_max", "VPD_opt", "VPD_50", "S_closure")),
+    # FIX: Force text to lowercase so it strictly matches scale_shape_manual keys
+    tree_group = tolower(trimws(tree_group)) 
+  ) %>%
+  arrange(metric, mean) %>% 
+  distinct() %>% 
+  ungroup() %>%
+  mutate(
+    species = factor(species, levels = species_order),
+    tree_group = stringr::str_to_title(tree_group) 
+  ) %>% 
+  group_by(metric) %>%
+  # Calculate the across-species mean for each metric
+  # (displayed as the vertical reference line).
+  mutate(panel_mean = mean(mean, na.rm = TRUE)) %>%
+  ungroup()
+
+
+metrics_list <- split(metrics_long, metrics_long$metric)
+
+make_panel <- function(data, title_text, x_axis_expr, y_title = NULL) {
+  
+  ggplot(data, aes(x = mean, y = fct_reorder(species, mean))) +
+    geom_vline(
+      aes(xintercept = panel_mean),
+      colour = "black",
+      linewidth = 0.4,
+      linetype = "dotted"
+    ) +
+    geom_errorbar(aes(xmin = l95, xmax = u95), 
+                  color = "gray40", width = 0, linewidth = 0.4) +
+    geom_point(aes(shape = tree_group, color=tree_group), 
+               size = 2.5, stroke = 0.5) + 
+    scale_shape_manual(
+      values = c("Broadleaved" = 16, "Conifer" = 17),
+      name = ""
+    ) +  
+    scale_color_manual(
+      values = c("Broadleaved" = "#41624D", "Conifer" = "#7798B9")
+    ) +
+    guides(
+      colour = "none",
+      shape = guide_legend(
+        override.aes = list(
+          colour = c("#41624D", "#7798B9")
+        )
+      )
+    ) +
+    
+    labs(title = title_text, x = x_axis_expr, y = y_title) +
+    theme_bw(base_size = 14) +
+    theme(
+      panel.grid.minor = element_blank(),
+      panel.grid.major.y = element_line(color = "gray96"),
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14), 
+      axis.text.y = element_text(face = "italic"),
+      
+      legend.position = "bottom"
+    )
+}
+
+
+# Create one panel for each stomatal behaviour metric.
+p1 <- make_panel(metrics_list$gs_max,    "Maximal capacity", expression(g[max]~(mol~m^{-2}~s^{-1})), "Species")
+p2 <- make_panel(metrics_list$VPD_opt,   "VPD optimum",      expression(VPD[opt]~(kPa)))
+p3 <- make_panel(metrics_list$VPD_50,    "VPD at half-closure",    expression(VPD[50]~(kPa)))
+p4 <- make_panel(metrics_list$S_closure, "Closure rate",     expression(S[closure]))
+
+
+fig_metrics <- (p1 | p2 | p3 | p4) +
+  plot_layout(guides = "collect") +
+  plot_annotation(
+    theme = theme(
+      plot.margin = margin(10, 10, 10, 10),
+      legend.position = "bottom",
+      legend.text = element_text(size = 20),
+      legend.title = element_text(size = 20),
+      legend.key.size = unit(2, "lines")
+    )
+  )
+
+
+ggsave(
+  filename = here::here("output", "Fig_S11_metrics.png"),
+  plot = fig_metrics,
+  width = 9.5,
+  height = 8,
+  dpi = 300
+)
+
+```
+
+
+

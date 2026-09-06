@@ -1,0 +1,11 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+*.nb.html
+
+data/*
+output/*
+
+renv/library/
+renv/local/
