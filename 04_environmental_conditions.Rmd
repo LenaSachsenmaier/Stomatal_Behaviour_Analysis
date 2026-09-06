@@ -28,6 +28,7 @@ library(emmeans)      # estimated marginal means and trends
 library(lubridate)    # working with dates and times
 library(SPEI)         # SPEI drought index and PET calculations
 library(soilDB)       # Rosetta pedotransfer model
+library(terra)        # for work with gridded data
 
 Sys.setlocale("LC_TIME", "C")  # use English month and weekday names
 
@@ -463,74 +464,15 @@ Figure_S5 <- ggarrange(fig_spei_12,
 
 ```{r load the data}
 
-# load the weather data from the station on site ARBOfun (KranWetter2) - as 10min intervals
-data_climate_2024 <- read.csv(here("data", "raw", "ARBOfun_climate_station_data_year2024_10min.csv")) %>% 
-  rename(date = YYYY.MM.DD,
-         time = Time,
-         timestamp = Timestamp,
-         radiation_diffuse = SPN1_Diff,
-         radiation_global =SPN1_Total,
-         voltage_reference= Vref,
-         battery_status = Bat,
-         wind_direction = WiRi,
-         wind_speed = WiGe,
-         wind_speed_peak = wg_peak,
-         temperature = Ltemp,
-         rel_humidity = relFeuchte,
-         air_pressure = Ldruck,
-         precipitation_sum = Regen,
-         precipitation_duration = RegenDau,
-         hail_sum = HagelSum,
-         hail_duration = HagelDau,
-         battery_status_vaisalla = Uv,
-         soil_watercontent_15 = X2_WC,
-         soil_conductivity_pores_15 = X2_ECp,
-         soil_temperature_15 = X2_ST,
-         soil_epsilon_calibration_15 = X2_e,
-         soil_conductivity_bulk_15 = X2_ECb,
-         soil_watercontent_50 = X3_WC,
-         soil_conductivity_pores_50 = X3_ECp,
-         soil_temperature_50 = X3_ST,
-         soil_epsilon_calibration_50 = X3_e,
-         soil_conductivity_bulk_50 = X3_ECb
-         ) %>% 
-  mutate(across(starts_with("soil_"), as.numeric)) %>% 
-  unite(date_time, date, time, sep="", remove=F) %>% 
-  mutate(date =  as.Date(date, format = '%Y-%m-%d'),
-         date_time = as.POSIXct(paste(date, time), format = "%Y-%m-%d %H:%M:%S"),
-         time = format(date_time, format = "%H:%M:%S"),
-         time_hms = hms(time))
+# load the weather data from the station on site ARBOfun - as 10min intervals
 
-
-# check the NAs
-data_climate_2024 %>%
-  filter(if_any(starts_with("soil"), is.na))
-
-# Calculate the VPD out of temperature and relative humidity
-data_climate_2024 <- data_climate_2024 %>% 
-  mutate(sVP = 0.6108 * exp((17.27 * temperature) / (temperature + 237.3)),
-         aVP = (rel_humidity / 100) * sVP,
-         VPD = sVP - aVP) %>% 
-  # calculate the diffuse fraction of radiation
-  mutate(diffuse_fraction = radiation_diffuse / radiation_global)
-
-
-# Subset the data for only our measurement days
-measurement_days <- as.Date(c(
-  "2024-06-12", "2024-06-13", "2024-06-18",
-  "2024-06-24", "2024-06-25", "2024-06-26",
-  "2024-06-27", "2024-07-09"
-))
-
-data_climate_measurementdays <- 
-  data_climate_2024  %>%
-  filter(date %in% measurement_days)
-
-data_climate_measurementdays_to_publish <- 
-  data_climate_measurementdays %>%
-  dplyr::select(c(date, date_time, time, temperature, VPD, rel_humidity, air_pressure, radiation_global, radiation_diffuse, wind_speed, wind_speed_peak, precipitation_sum, soil_watercontent_15, soil_watercontent_50, soil_temperature_15, soil_temperature_50))
-
-write_csv(data_climate_measurementdays_to_publish, here("data", "processed", "climate_measurement_days_ARBOfun.csv"))
+data_climate_2024 <- 
+  read.csv(here("data", "raw", "02_data_climate_station_ARBOfun.csv")) %>% 
+  # change the UTC time zone to the Europe/Berlin time zone
+  mutate(
+    date_time = ymd_hms(date_time, tz = "UTC") %>%
+      with_tz("Europe/Berlin")
+  )
 
 ```
 
@@ -551,7 +493,7 @@ stom_con <- read_csv(here("data", "processed", "data_cleaned.csv"))
   rename(day = date) %>% 
   arrange(date_time) %>% 
   mutate(nearest_time = lubridate::round_date(date_time, unit = "10 mins")) %>% 
-  left_join(data_climate_measurementdays, 
+  left_join(data_climate_2024, 
             by = c("nearest_time" = "date_time")) %>%
   # create a date variable that is character
   mutate(day_chr= as.character(day)) %>% 
@@ -559,8 +501,8 @@ stom_con <- read_csv(here("data", "processed", "data_cleaned.csv"))
   # For each leaf measurement time, look up the nearest two weather station measurements and linearly interpolate the air VPD, so     that each leaf measurement has a matching air VPD.
   mutate(
     VPD_air_interp = approx( # base R linear interpolation function with x and y and the new estimates for xout
-      x = data_climate_measurementdays$date_time, # the known time points from the weather station
-      y = data_climate_measurementdays$VPD, # these are the corresponding air VPD from the weather station
+      x = data_climate_2024$date_time, # the known time points from the weather station
+      y = data_climate_2024$VPD, # these are the corresponding air VPD from the weather station
       xout = date_time # the time points of my leaf VPD measurements, for which we want extimated values
     )$y # since we only want the interpolated VPD values not x and y
   ) %>% 
@@ -602,9 +544,10 @@ measurement_times <- data %>%
   )
 
 
-for_vpd_fig <- data_climate_measurementdays %>%
+for_vpd_fig <- data_climate_2024 %>%
   left_join(measurement_times, by = "date") %>% 
   mutate(
+    time_hms = hms::as_hms(time),
     in_window = time_hms >= first_time & time_hms <= last_time
   )
 
@@ -645,7 +588,7 @@ rm(for_vpd_fig)
 
 ```
 
-## 2.4. Supplem. Fig. S2 - VPD leaf vs. VPD air
+## 2.4. Supplem. Fig. S4 - VPD leaf vs. VPD air
 
 ```{r VPD leaf vs. VPD air, fig.height=10, fig.width=10}
 
@@ -724,16 +667,18 @@ conversion_fig <-
     hjust = 1, vjust = 1,
     inherit.aes = FALSE
   ) +
-  scale_colour_manual(values= c("#4C78A8", "#72B7B2", "#A0AEC0")) +
+  scale_colour_manual(values= c("#4EA8DE", "#A29BFE", "#5B7065")) +
   facet_wrap(~species, ncol=5) +
   labs(
-    x = "Leaf VPD (kPa)",
-    y = "Interpolated Air VPD (kPa)"
+  x = expression("Leaf-to-air vapour pressure deficit (" * VPD[L] * "; kPa)"),
+  y = expression("Atmospheric vapour pressure deficit (" * VPD[air] * "; kPa)")
   ) +
   theme_bw() +
     theme(legend.position = "none")
 
 conversion_fig
+
+ggsave(here("output", "Fig_S4_VPDleaf_vs_VPDair.png"), conversion_fig, height=10, width=8)
 
 ```
 
@@ -755,7 +700,7 @@ median_table <-
         rel_humidity = median(rel_humidity, na.rm = TRUE),
         wind_speed = median(wind_speed, na.rm = TRUE),
         radiation_global = median(radiation_global, na.rm = TRUE),
-        fract_diff_radiation = median(diffuse_fraction, na.rm = TRUE),
+        # fract_diff_radiation = median(diffuse_fraction, na.rm = TRUE),
         soil_moisture_15 = median(soil_watercontent_15, na.rm = TRUE),
         soil_moisture_50 = median(soil_watercontent_50, na.rm = TRUE),
     .groups = "drop"
@@ -771,7 +716,81 @@ median_table
 
 ```{r load the data from UFZ}
 
+# load the data from UFZ Dürremonitor
 
+drought_intensity_upper <- terra::rast(here("data", "raw", "droughtintensity_SM_0_25cm_apr-oct.nc"))
+drought_intensity_all <- terra::rast(here("data", "raw", "droughtintensity_SM_Lall_apr-oct.nc"))
+
+drought_monthly_all <- terra::rast(here("data", "raw", "SMI_Gesamtboden_monatlich.nc"))
+drought_monthly_upper <- terra::rast(here("data", "raw", "SMI_Oberboden_monatlich.nc"))
+
+
+# coordinates of the site research arboretum ARBOfun
+arbofun <- terra::vect(
+  data.frame(
+    lon = 12.500000,
+    lat = 51.266667
+  ),
+  geom = c("lon", "lat"),
+  crs = "EPSG:4326"
+)
+
+
+
+# extract the data needed
+
+# helper function
+extract_ufz <- function(raster, site, year = NULL) {
+  
+  if (!is.null(year)) {
+    raster <- raster[[format(time(raster), "%Y") == year]]
+  }
+  
+  raster |>
+    terra::extract(site) |>
+    as_tibble() |>
+    pivot_longer(
+      cols = -ID,
+      names_to = "layer",
+      values_to = "value"
+    ) |>
+    mutate(
+      date = time(raster)
+    )
+}
+
+
+## extract data needed
+
+# Monthly SMI, 2024
+smi_upper <- extract_ufz(
+  drought_monthly_upper,
+  arbofun,
+  year = "2024"
+)
+
+smi_all <- extract_ufz(
+  drought_monthly_all,
+  arbofun,
+  year = "2024"
+)
+
+
+# April–October drought intensity, 2024
+drought_intensity_upper_site <- extract_ufz(
+  drought_intensity_upper,
+  arbofun,
+  year = "2024"
+)
+
+drought_intensity_all_site <- extract_ufz(
+  drought_intensity_all,
+  arbofun,
+  year = "2024"
+)
+
+
+terra::describe(drought_monthly_upper) |> head(50)
 
 ```
 
@@ -784,8 +803,60 @@ median_table
 
 ```{r map}
 
+smi_plot <- bind_rows(
+  smi_upper  %>%  mutate(soil = "Upper soil (0–25 cm)"),
+  smi_all  %>%  mutate(soil = "Total soil")
+)
 
-
+smi_fig <- ggplot(smi_plot, aes(x = date, y = value, linetype = soil)) +
+  
+  geom_hline(
+    yintercept = c(0.20),
+    linetype = "solid",
+    linewidth = 0.7,
+    colour="darkred"
+  ) +
+  geom_rect(
+  aes(
+    xmin = as.Date("2024-06-12"),
+    xmax = as.Date("2024-07-09"),
+    ymin = -Inf,
+    ymax = Inf
+  ),
+  inherit.aes = FALSE,
+  alpha = 0.02
+  ) +
+  
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  
+    annotate(
+      "text",
+      x = as.Date("2024-01-01"),
+      y = 0.20,
+      label = "drought threshold",
+      hjust = 0,
+      vjust = -0.5,
+      size = 3.5,
+      colour="darkred"
+    ) +
+  
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.2)
+  ) +
+  
+  scale_x_date(
+    date_breaks = "1 month",
+    date_labels = "%b"
+  ) +
+  
+  labs(
+    x = NULL,
+    y = "Soil moisture index (SMI)",
+    linetype = NULL
+  ) +
+  theme_classic(base_size=18)
 
 ```
 
@@ -797,7 +868,7 @@ median_table
 
 # prepare the dataframe
 Soil_Moisture_2024 <- data_climate_2024 %>%
-  dplyr::select(timestamp, date_time, time, date, time_hms, starts_with("soil")) %>% 
+  dplyr::select(date_time, time, date, starts_with("soil")) %>% 
   pivot_longer(cols=starts_with("soil"),
                names_to = c(".value", "depth"),
                names_pattern = "(.+)_([0-9]+)$")
@@ -811,13 +882,15 @@ measurement_days <- Soil_Moisture_Measurementdays %>% distinct(date) %>% pull(da
 
 
 
-for_soil_fig <- data_climate_measurementdays %>%
-    dplyr::select(timestamp, date_time, time, date, time_hms, starts_with("soil")) %>% 
+for_soil_fig <- data_climate_2024 %>%
+    dplyr::select(date_time, time, date, starts_with("soil")) %>% 
   pivot_longer(cols=starts_with("soil"),
                names_to = c(".value", "depth"),
                names_pattern = "(.+)_([0-9]+)$") %>% 
-  left_join(measurement_times, by = "date") %>% 
+    filter(date %in% measurement_days) %>%
+  left_join(measurement_times) %>% 
   mutate(
+    time_hms = hms::as_hms(time),
     in_window = time_hms >= first_time & time_hms <= last_time
   )
 
@@ -825,13 +898,11 @@ plot_data <- for_soil_fig %>%
   filter(depth==50)
 
 
+
 fig_soil_moist <- 
   plot_data %>% 
   ggplot(
        aes(x = time_hms, y = soil_watercontent, group = date)) +
-  # since it was all in the range between FC and WP:
-    annotate("rect", xmin = xmin, xmax = xmax, ymin = -Inf, ymax = Inf,
-           fill = "steelblue", alpha = 0.1) +
 
   # full line in grey
   geom_line(color = "grey85", linewidth = 1) +
@@ -854,7 +925,7 @@ scale_x_time(
   labels = scales::label_time("%H:%M")
 ) +
 
-  theme_bw(base_size = 18) +
+  theme_classic(base_size = 18) +
 ylim(13.2, 25.5) +
   theme(
     # axis.title.x = element_blank(),
@@ -869,11 +940,17 @@ fig_soil_moist
 ```{r supplementary soil moisture joined, fig.width=9, fig.height=10}
 
 # Stack Plot A over Plot B
-Figure_S2 <- Supplementary_Figure_soil_moist_50cm_zone /fig_soil_moist + 
+Figure_S2 <- smi_fig /fig_soil_moist + 
   plot_layout(guides = "keep", design = "A\nB") + # Keeps a single legend if they share the same scale
-  plot_annotation(tag_levels = "A")   # Automatically adds 'A' and 'B' to the top left
+  plot_annotation(
+  tag_levels = "a",
+  tag_prefix = "(",
+  tag_suffix = ")"
+)
 
 Figure_S2
+
+ggsave(here("output", "Fig_S2_Soil.png"), height=12, width=11)
 
 ```
 
@@ -931,6 +1008,8 @@ scale_colour_gradientn(
     legend.position = "right"
   )
 Figure_S3
+
+ggsave(here("output", "Fig_S3_stratification_days.png"), Figure_S3, height=6, width=9)
 
 ```
 
