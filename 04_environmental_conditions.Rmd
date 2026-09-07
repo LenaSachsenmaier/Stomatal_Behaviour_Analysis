@@ -584,7 +584,7 @@ rm(for_vpd_fig)
 
 ```
 
-## 2.4. Supplem. Fig. S4 - VPD leaf vs. VPD air
+## 2.4. Supplem. Fig. S12 - VPD leaf vs. VPD air
 
 ```{r VPD leaf vs. VPD air, fig.height=10, fig.width=10}
 
@@ -674,7 +674,7 @@ conversion_fig <-
 
 conversion_fig
 
-ggsave(here("output", "Fig_S4_VPDleaf_vs_VPDair.png"), conversion_fig, height=10, width=8)
+ggsave(here("output", "Fig_S12_VPDleaf_vs_VPDair.png"), conversion_fig, height=10, width=8)
 
 ```
 
