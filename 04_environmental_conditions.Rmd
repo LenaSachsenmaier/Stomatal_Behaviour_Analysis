@@ -712,7 +712,36 @@ median_table
 
 ```{r load the data from UFZ}
 
-# load the data from UFZ Dürremonitor
+# Download UFZ Dürremonitor data into the data folder
+
+ufz_url <- "https://files.ufz.de/~drought"
+
+ufz_files <- c(
+  "droughtintensity_SM_0_25cm_apr-oct.nc",
+  "droughtintensity_SM_Lall_apr-oct.nc",
+  "SMI_Gesamtboden_monatlich.nc",
+  "SMI_Oberboden_monatlich.nc"
+)
+
+raw_dir <- here::here("data", "raw")
+dir.create(raw_dir, showWarnings = FALSE, recursive = TRUE)
+
+for (file in ufz_files) {
+  
+  dest <- file.path(raw_dir, file)
+  
+  if (!file.exists(dest)) {
+    download.file(
+      url = paste0(ufz_url, "/", file),
+      destfile = dest,
+      mode = "wb"
+    )
+  }
+}
+
+
+
+# load the data
 
 drought_intensity_upper <- terra::rast(here("data", "raw", "droughtintensity_SM_0_25cm_apr-oct.nc"))
 drought_intensity_all <- terra::rast(here("data", "raw", "droughtintensity_SM_Lall_apr-oct.nc"))
