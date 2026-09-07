@@ -811,8 +811,8 @@ write_csv(stomatal_behaviour_species_metrics, here::here("data", "processed", "s
 
 
 
-## 3.3. Metrics overview - Table S3
-```{r supplement table S3}
+## 3.3. Metrics overview - Table S6
+```{r supplement table S6}
 
 # 1. Calculate the raw statistics and format into single cells
 metrics_formatted_table <- stomatal_behaviour_species_metrics %>%
@@ -834,11 +834,11 @@ metrics_formatted_table <- stomatal_behaviour_species_metrics %>%
 
 metrics_formatted_table
 
-write_xlsx(metrics_formatted_table, here::here("output", "Tab_S3_stomatal_behaviour_species_metrics.xlsx"))
+write_xlsx(metrics_formatted_table, here::here("output", "Tab_S6_stomatal_behaviour_species_metrics.xlsx"))
 
 ```
 
-##3.4. Test gymno vs. angio
+##3.4. Differences gymno vs. angio - Fig. S8
 
 ```{r gymno vs. angio}
 
@@ -937,6 +937,8 @@ fig_metric_diff_tree_group <- ggplot(group_post, aes(x = value, fill = group)) +
   theme_minimal(base_size = 13) +
   theme(legend.position = "bottom", 
         strip.text = element_text(face = "bold"))
+
+ggsave(fig_metric_diff_tree_group, here("output", "Fig_S8_clade_differences.png", height=6, width=10))
 
 ```
 
@@ -1201,8 +1203,8 @@ ggsave(
 
 
 
-## 4.3. Fig. 3 - Stomatal response curves
-```{r curves of all species}
+## 4.3. Fig. 2 - Stomatal response curves
+```{r fig 2 curves of all species}
 
 # Use posterior mean predictions generated in Section 2.2.
 # These represent population-level curves without tree/leaf random effects.
@@ -1408,9 +1410,9 @@ ggsave(
 ```
 
 
-## 4.4. Fig. 4 - Stomatal Behaviour Metrics
+## 4.4. Fig. 3 - Stomatal Behaviour metrics
 
-```{r figure 4 - all metrics in one space}
+```{r figure 3 - all metrics in one space}
 
 stomatal_behaviour_species_metrics <- 
   stomatal_behaviour_species_metrics %>%
@@ -1679,7 +1681,7 @@ ggsave(here("output", "Fig_S6_Priors.png"), fig_prior_predictive, dpi=300, heigh
 ```
 
 
-## 5.2. Fig. S7 - Curves of single species
+## 5.2. Fig. S5 - Curves of single species
 ```{r single species curve}
 
 # Create the single faceted plot
@@ -1706,7 +1708,7 @@ facet_plot <- ggplot() +
   )
 
 ggsave(
-  filename = here::here("output", "Fig_S7_species_curves.png"),
+  filename = here::here("output", "Fig_S5_species_curves.png"),
   plot = facet_plot,
   width = 6.5,
   height = 9,
@@ -1972,7 +1974,7 @@ library(car)
 vif(lm(gs_max ~ VPD_opt + VPD50 + Sclosure, data = data_pca))
 
 ```
-## 5.6. Fig. S11 - Overview of Metrics
+## 5.6. Fig. S7 - Overview of Metrics
 
 ```{r metrics figure}
 
@@ -2086,7 +2088,7 @@ fig_metrics <- (p1 | p2 | p3 | p4) +
 
 
 ggsave(
-  filename = here::here("output", "Fig_S11_metrics.png"),
+  filename = here::here("output", "Fig_S7_metrics.png"),
   plot = fig_metrics,
   width = 9.5,
   height = 8,
