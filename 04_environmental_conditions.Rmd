@@ -4,14 +4,10 @@ author: "Lena Sachsenmaier"
 output:
   html_document:
     df_print: paged
-contact: lena.sachsenmaier@idiv.de
-update: "2026-07-27"
+contact: lena.sachsenmaier.research@gmail.com
+created: "2026-07-27"
 updated: "`r format(Sys.time(), '%d %B, %Y')`"
 ---
-
-**updated by**: Lena Sachsenmaier
-**Contact**: lena.sachsenmaier@idiv.de  
-**Last updated**: `r format(Sys.time(), '%d %B, %Y')`
 
 
 Loading the packages needed:
