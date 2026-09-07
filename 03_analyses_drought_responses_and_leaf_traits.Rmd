@@ -4,13 +4,11 @@ author: "Lena Sachsenmaier"
 output:
   html_document:
     df_print: paged
-contact: lena.sachsenmaier@idiv.de
-update: "2026-07-30"
+contact: lena.sachsenmaier.research@gmail.de
+created: "2026-07-30"
+updated: "`r format(Sys.time(), '%d %B, %Y')`"
 ---
 
-**updated by**: Lena Sachsenmaier
-**Contact**: lena.sachsenmaier@idiv.de  
-**Last updated**: `r format(Sys.time(), '%d %B, %Y')`
 
 # Analysis of stomatal behaviour metrics and their relationships with
 # leaf traits and drought response responses
@@ -383,7 +381,7 @@ run_metric_models <- function(metrics, predictors, df, suffix = "") {
         formula = model_formula,
         data = df,
         chains = 4,
-        iter = 2000,
+        iter = 4000, # changed to 4000 instead of 2000 (on 07.09.2026)
         cores = 4,
         file = here::here("output", "models", model_name),
         file_refit = "on_change"
