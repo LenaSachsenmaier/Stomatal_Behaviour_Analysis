@@ -1,5 +1,5 @@
 ---
-title: "Stomatal Behaviour - 03 Trait Analysis"
+title: "Stomatal Behaviour - 03 d13C & Trait Analysis"
 author: "Lena Sachsenmaier"
 output:
   html_document:
@@ -10,8 +10,7 @@ updated: "`r format(Sys.time(), '%d %B, %Y')`"
 ---
 
 
-# Analysis of stomatal behaviour metrics and their relationships with
-# leaf traits and drought response responses
+# Analysis of stomatal behaviour metrics and their relationships with leaf traits and drought response responses
 
 ```{r setup, include=FALSE}
 
