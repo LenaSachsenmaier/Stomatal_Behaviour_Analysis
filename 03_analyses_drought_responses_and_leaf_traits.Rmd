@@ -397,7 +397,7 @@ run_metric_models <- function(metrics, predictors, df, suffix = "") {
 
 
 
-## 2.2. Relationships between stomatal behaviour and leaf traits 
+## 2.2. Relationships: behaviour & leaf traits 
 
 ```{r trait models}
 # Test whether leaf functional traits explain variation in stomatal behaviour metrics.
@@ -417,7 +417,7 @@ run_metric_models(
 ```
 
 
-## 2.3. Relationship between stomatal behaviour and leaf ∆δ13C
+## 2.3. Relationship: behaviour and leaf ∆δ13C
 
 ```{r d13C models}
 
@@ -440,7 +440,7 @@ run_metric_models(
 
 
 # 3. Main Figures
-## 3.1. Fig. 6 - Leaf traits effect size figure
+## 3.1. Fig. 5 - Leaf traits effect size figure
 ```{r leaf trait effect size figure}
 
 metrics <- c("gs_max", "VPD_opt", "VPD50", "Sclosure")
@@ -925,7 +925,7 @@ generate_trait_panel <- function(metric, trait, raw_data, show_y_label = TRUE) {
 
 ```
 
-### 3.2.2. Fig. 7 - Leaf traits & Max. capacity figure
+### 3.2.2. Fig. 6 - Leaf traits & Max. capacity figure
 
 ```{r gs max figure}
 # Generate the individual panels
@@ -958,7 +958,7 @@ ggsave(here("output", "Figure_7.pdf"), fig_gsmax, height=4, width=9, dpi=1000)
 
 ```
 
-### 3.2.3. Fig. 8 - Leaf traits & Stomatal sensitivity figure
+### 3.2.3. Fig. S11 - Leaf traits & Stomatal sensitivity figure
 ```{r model figures - SLA}
 
 ### Row 1: VPD optimum (VPD_opt)
@@ -1001,7 +1001,7 @@ fig_vpd_traits <- (
 fig_vpd_traits
 
 ggsave(
-  here::here("output", "Fig_8_vpd_metrics.png"), 
+  here::here("output", "Fig_11_vpd_metrics.png"), 
   fig_vpd_traits, 
   height = 10, 
   width = 8
@@ -1297,7 +1297,7 @@ if (halo) {
 
 ```
 
-### 3.3.3. Fig. 5 - Stomatal behaviour & drought response
+### 3.3.3. Fig. 4 - Stomatal behaviour & drought response
 ```{r figures d13C}
 
 mean_d13C <- mean(data_for_models$delta_d13C, na.rm = TRUE)
@@ -1398,306 +1398,9 @@ ggsave(
 ```
 
 
-
-
 # 4. Supplementary Figures
 
-## 4.1. Fig. S11 - PCA Leaf Traits 
-
-```{r pca leaf traits}
-
-tree_group_info <- data_mean %>% dplyr::select(species, tree_group) %>% distinct() %>% ungroup()
-
-# only angio
-
-data_pca <- data_mean %>%
-  filter(tree_group=="broadleaved") %>% 
-  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
-  as.data.frame()
-
-species_names <- data_mean %>% 
-  filter(tree_group=="broadleaved") %>% 
-  pull(species)
-
-rownames(data_pca) <- species_names
-
-pca_res <- prcomp(data_pca, 
-                  center = TRUE, 
-                  scale. = TRUE)
-
-
-# 1. Extract Individual Scores (the points)
-ind_coords <- as.data.frame(pca_res$x)
-ind_coords$species <- rownames(ind_coords)
-ind_coords <- ind_coords %>% left_join(tree_group_info)
-
-# 2. Extract Variable Loadings (the arrows)
-# We multiply by a scaling factor so arrows are visible on the same scale as points
-var_coords <- as.data.frame(pca_res$rotation)
-var_coords$var_names <- rownames(var_coords)
-
-# flip both axes for angio so trait directions match gymno's orientation
-ind_coords$PC1 <- -ind_coords$PC1
-ind_coords$PC2 <- -ind_coords$PC2
-var_coords$PC1 <- -var_coords$PC1
-var_coords$PC2 <- -var_coords$PC2
-
-# extract the scores
-pca_scores_angio <- ind_coords %>%
-  dplyr::select(species, PC1, PC2)
-
-mult <- min(
-  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
-    (max(var_coords$PC1) - min(var_coords$PC1)),
-  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
-    (max(var_coords$PC2) - min(var_coords$PC2))
-) * 0.7 # Adjust this multiplier to change arrow length
-
-# 1. Calculate percentage of variance
-# sdev is the square root of the eigenvalues
-pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
-pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
-pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
-
-pca_traits_angio <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
-      # Styling to match fviz_pca
-  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
-  # Variable arrows
-  geom_segment(data = var_coords, 
-               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
-               arrow = arrow(length = unit(0.2, "cm")), 
-               color = "black", linewidth = 0.7) +
-  
-  # Variable labels
-  geom_text_repel(data = var_coords, 
-                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
-                  color = "black", fontface = "bold", size = 4) +
-  
-  # Individual points & labels
-  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
-  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
-    
-  scale_colour_manual(
-    values = c(
-      "broadleaved" = "#41624D",
-      "conifer" = "#7798B9"
-    )
-  ) +
-    scale_shape_manual(
-    values = c(
-      "broadleaved" = 16,
-      "conifer" = 17
-    )
-  ) +
-theme_minimal() +
-labs(x = pc1_lab, y = pc2_lab) +
-# coord_cartesian(xlim = x_limits, ylim = y_limits) +
-coord_fixed() +
-theme(legend.position = "none")
-pca_traits_angio
-
-
-
-# only gymno
-
-data_pca <- data_mean %>%
-  filter(tree_group=="conifer") %>% 
-  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
-  as.data.frame()
-
-species_names <- data_mean %>% 
-  filter(tree_group=="conifer") %>%
-  pull(species)
-
-rownames(data_pca) <- species_names
-
-pca_res <- prcomp(data_pca, 
-                  center = TRUE, 
-                  scale. = TRUE)
-
-
-# 1. Extract Individual Scores (the points)
-ind_coords <- as.data.frame(pca_res$x)
-ind_coords$species <- rownames(ind_coords)
-ind_coords <- ind_coords %>% left_join(tree_group_info)
-
-# extract the scores
-pca_scores_gymno <- ind_coords %>%
-  dplyr::select(species, PC1, PC2)
-
-
-# 2. Extract Variable Loadings (the arrows)
-# We multiply by a scaling factor (e.g., 5) so arrows are visible on the same scale as points
-var_coords <- as.data.frame(pca_res$rotation)
-var_coords$var_names <- rownames(var_coords)
-mult <- min(
-  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
-    (max(var_coords$PC1) - min(var_coords$PC1)),
-  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
-    (max(var_coords$PC2) - min(var_coords$PC2))
-) * 0.7 # Adjust this multiplier to change arrow length
-
-
-
-
-
-# 1. Calculate percentage of variance
-# sdev is the square root of the eigenvalues
-pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
-pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
-pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
-
-
-
-pca_traits_gymno <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
-  
-  # Styling to match fviz_pca
-    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
-    # Variable arrows
-  geom_segment(data = var_coords, 
-               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
-               arrow = arrow(length = unit(0.2, "cm")), 
-               color = "black", linewidth = 0.7) +
-  
-  # Variable labels
-  geom_text_repel(data = var_coords, 
-                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
-                  color = "black", fontface = "bold", size = 4) +
-  # Individual points & labels
-  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
-  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
-    
-  scale_colour_manual(
-    values = c(
-      "broadleaved" = "#41624D",
-      "conifer" = "#7798B9"
-    )
-  ) +
-    scale_shape_manual(
-    values = c(
-      "broadleaved" = 16,
-      "conifer" = 17
-    )
-  ) +
-theme_minimal() +
-labs(x = pc1_lab, y = pc2_lab) +
-# coord_cartesian(xlim = x_limits, ylim = y_limits) +
-coord_fixed() +
-theme(legend.position = "none")
-
-pca_traits_gymno
-
-
-# joined figure
-PCA_all_leaf_traits_separated <- 
-  pca_traits_angio +
-  pca_traits_gymno +
-  plot_layout(nrow(1))
-
-ggsave(here("output", "Figure_S11_PCA_leaf_traits.png"), PCA_all_leaf_traits_separated, height=7, width=11)
-
-
-# extract the PCA scors
-pca_scores_separate <- bind_rows(
-  pca_scores_angio,
-  pca_scores_gymno
-)
-
-
-
-# PCA overall
-
-data_pca <- data_mean %>%
-  dplyr::select(SD, GCL, SLA, LDMC, leaf_N_area, thick, tough) %>% 
-  as.data.frame()
-
-species_names <- data_mean %>% 
-  pull(species)
-
-rownames(data_pca) <- species_names
-
-pca_res <- prcomp(data_pca, 
-                  center = TRUE, 
-                  scale. = TRUE)
-
-
-# 1. Extract Individual Scores (the points)
-ind_coords <- as.data.frame(pca_res$x)
-ind_coords$species <- rownames(ind_coords)
-ind_coords <- ind_coords %>% left_join(tree_group_info)
-
-
-# 2. Extract Variable Loadings (the arrows)
-# We multiply by a scaling factor (e.g., 5) so arrows are visible on the same scale as points
-var_coords <- as.data.frame(pca_res$rotation)
-var_coords$var_names <- rownames(var_coords)
-mult <- min(
-  (max(ind_coords$PC1) - min(ind_coords$PC1)) /
-    (max(var_coords$PC1) - min(var_coords$PC1)),
-  (max(ind_coords$PC2) - min(ind_coords$PC2)) /
-    (max(var_coords$PC2) - min(var_coords$PC2))
-) * 0.7 # Adjust this multiplier to change arrow length
-
-
-# 1. Calculate percentage of variance
-# sdev is the square root of the eigenvalues
-pca_var <- (pca_res$sdev^2) / sum(pca_res$sdev^2) * 100
-pc1_lab <- paste0("PC1 (", round(pca_var[1], 1), "%)")
-pc2_lab <- paste0("PC2 (", round(pca_var[2], 1), "%)")
-
-
-
-pca_traits_both <- ggplot(ind_coords, aes(x = PC1, y = PC2)) +
-  
-  # Styling to match fviz_pca
-    geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
-  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5) +
-    # Variable arrows
-  geom_segment(data = var_coords, 
-               aes(x = 0, y = 0, xend = PC1 * mult, yend = PC2 * mult),
-               arrow = arrow(length = unit(0.2, "cm")), 
-               color = "black", linewidth = 0.7) +
-  
-  # Variable labels
-  geom_text_repel(data = var_coords, 
-                  aes(x = PC1 * mult, y = PC2 * mult, label = var_names),
-                  color = "black", fontface = "bold", size = 4) +
-  # Individual points & labels
-  geom_point(aes(color = tree_group, shape=tree_group), size = 3) +
-  geom_text_repel(aes(label = species, colour=tree_group), size = 3) +
-    
-  scale_colour_manual(
-    values = c(
-      "broadleaved" = "#41624D",
-      "conifer" = "#7798B9"
-    )
-  ) +
-    scale_shape_manual(
-    values = c(
-      "broadleaved" = 16,
-      "conifer" = 17
-    )
-  ) +
-theme_minimal() +
-labs(x = pc1_lab, y = pc2_lab) +
-# coord_cartesian(xlim = x_limits, ylim = y_limits) +
-coord_fixed() +
-theme(legend.position = "none")
-
-pca_traits_both
-
-
-# extract the scores
-pca_scores_one_pca <- ind_coords %>%
-  dplyr::select(species, PC1, PC2)
-
-```
-
-
-
-## 4.2. Fig. S12 - Stomata Density x Size
+## 4.1. Fig. S13 - Stomata Density x Size
 
 ```{r density size}
 
@@ -1818,7 +1521,7 @@ fig_SD_GCL <- fig_SD_GCL_all +
                 top = 0.98)
 fig_SD_GCL
 
-ggsave(here("output", "Fig_S12_stom_dens_size.png"), fig_SD_GCL,  height=5, width=7, dpi=300)
+ggsave(here("output", "Fig_S13_stom_dens_size.png"), fig_SD_GCL,  height=5, width=7, dpi=300)
 
 
 ```
@@ -1826,7 +1529,7 @@ ggsave(here("output", "Fig_S12_stom_dens_size.png"), fig_SD_GCL,  height=5, widt
 
 
 # 5. Supplementary Tables
-## 5.1. Tab. S9 - Leaf trait model summary
+## 5.1. Tab. S8 - Leaf trait model summary
 ```{r leaf trait model results table}
 
 
@@ -1924,12 +1627,12 @@ summary_table_trait_models <-
   )
 
 # Save files
-write_xlsx(summary_table_trait_models, here("output", "Table_S9_model_summary_table_traits.xlsx"))
+write_xlsx(summary_table_trait_models, here("output", "Table_S8_model_summary_table_traits.xlsx"))
 
 ```
 
 
-## 5.2. Tab. S10 - Leaf ∆δ13C model summary
+## 5.2. Tab. S9 - Leaf ∆δ13C model summary
 ```{r Dd13C model results table}
 
 model_list_Dd13C <- list(
@@ -1987,7 +1690,7 @@ extract_model_metrics_named <- function(model_name, model_obj, g1, g2) {
 # 3. Run the loop across your model list
 summary_table_Dd13C <- imap_dfr(model_list_Dd13C, ~extract_model_metrics_named(.y, .x, broadleaved, conifer))
 
-write_xlsx(summary_table_Dd13C, here("output", "Table_S10_model_summary_table_Dd13C.xlsx"))
+write_xlsx(summary_table_Dd13C, here("output", "Table_S9_model_summary_table_Dd13C.xlsx"))
 
 ```
 
