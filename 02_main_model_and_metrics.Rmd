@@ -20,6 +20,7 @@ library(brms)
 library(loo)
 library(bayesplot) # for diagnostics and figures of brms() models
 library(tidybayes) # for easy viusalization of bayesian models
+library(posterior)
 
 # correlation analysis
 library(Hmisc) # for correlation matrix
@@ -226,12 +227,6 @@ model <- brm(
 ```{r posterior predictions of the model}
 
 
-# data <- data %>% mutate(species= case_when(
-#                                   species=="Pla_his" ~ "Pla_ace", 
-#                                   species=="Cor_dom" ~ "Sor_dom",
-#                                   species=="Tor_gla" ~ "Sor_tor",
-#                                   TRUE ~ species))
-
 species_list <- unique(data$species)
 species_list
 
@@ -242,13 +237,6 @@ posterior_draws <- map_df(species_list, function(sp) {
     mutate(species = sp)
 })
 
-# 
-# posterior_draws <- posterior_draws %>% mutate(species= case_when(
-#                                   species== "Pla_ace" ~ "Pla_his",
-#                                   species=="Sor_dom" ~ "Cor_dom",
-#                                   species== "Sor_tor" ~ "Tor_gla",
-#                                   TRUE ~ species)) %>% 
-#   arrange(species)
 
 # predict species mean curves across all draws:
 posterior_means <- map_df(species_list, function(sp) {
@@ -257,19 +245,6 @@ posterior_means <- map_df(species_list, function(sp) {
     mutate(species = sp)
 })
 
-# posterior_means <- posterior_means %>% mutate(species= case_when(
-#                                   species== "Pla_ace" ~ "Pla_his",
-#                                   species=="Sor_dom" ~ "Cor_dom",
-#                                   species== "Sor_tor" ~ "Tor_gla",
-#                                   TRUE ~ species)) %>% 
-#   arrange(species)
-# 
-# data <- data %>% mutate(species= case_when(
-#                                   species== "Pla_ace" ~ "Pla_his",
-#                                   species=="Sor_dom" ~ "Cor_dom",
-#                                   species== "Sor_tor" ~ "Tor_gla",
-#                                   TRUE ~ species)) %>% 
-#   arrange(species)
 
 ```
 
@@ -502,18 +477,8 @@ cat("Worst Rhat in the entire model:", round(max_rhat, 3), "\n")
 cat("Lowest Bulk-ESS in the entire model:", round(min_bulk, 0), "\n")
 
 
-# raw diagnostics
-# all_diagnostics <- brms::rhat(model) %>% 
-#   as.data.frame() %>% 
-#   rownames_to_column(var = "Parameter_Raw") %>% 
-#   rename(Rhat = ".") %>% 
-#   mutate(
-#     Bulk_ESS = brms::neff_ratio(model)[Parameter_Raw] * brms::ndraws(model),
-#     Tail_ESS = brms::neff_ratio(model)[Parameter_Raw] * brms::ndraws(model) 
-#   )
 
 
-library(posterior)
 
 diag_df <- brms::as_draws_array(model) %>%
   summarise_draws("rhat", "ess_bulk", "ess_tail") %>%
@@ -795,16 +760,6 @@ stomatal_behaviour_species_metrics <-
 write_csv(stomatal_behaviour_metrics, here::here("data", "processed", "stomatal_behaviour_metrics.csv"))
 write_csv(stomatal_behaviour_species_metrics, here::here("data", "processed", "stomatal_behaviour_species_metrics.csv"))
 
-# # reload metrics
-# stomatal_behaviour_metrics <- 
-#   read_csv(here::here("data", "processed", "stomatal_behaviour_metrics.csv")) %>% 
-#     mutate(tree_group = case_when(species == "Cor_dom" | species == "Pla_his" | species == "Tor_gla" ~ "broadleaved",
-#                                 TRUE ~ tree_group))
-# 
-# stomatal_behaviour_species_metrics <-
-#   read_csv( here::here("data", "processed", "stomatal_behaviour_species_metrics.csv")) %>% 
-#   mutate(tree_group = case_when(species == "Cor_dom" | species == "Pla_his" | species == "Tor_gla" ~ "broadleaved",
-#                                 TRUE ~ tree_group))
 
 ```
 
@@ -1061,31 +1016,6 @@ combined_plot <- (p_full + p_leaf) +
   theme(
     plot.tag = element_text(face = "bold", size = 12)
   )
-# 
-# 
-# ggsave(
-#   filename = here::here(
-#     "output",
-#     "Fig_1_model_fit_example.png"
-#   ),
-#   plot = combined_plot,
-#   width = 9,
-#   height = 5,
-#   dpi = 300
-# )
-# 
-# 
-# # save for submission
-# ggsave(
-#   filename = here::here(
-#     "output",
-#     "Figure_1.pdf"
-#   ),
-#   plot = combined_plot,
-#   width = 9,
-#   height = 5,
-#   dpi = 1000
-# )
 
 
 ```
@@ -1153,28 +1083,6 @@ fig_extraction_method <-
 
 fig_extraction_method
 
-# ggsave(
-#   filename = here::here(
-#     "output",
-#     "Fig_2_extraction_method.png"
-#   ),
-#   plot = fig_extraction_method,
-#   width = 8,
-#   height = 6,
-#   dpi = 300
-# )
-# 
-# # figure for submission
-# ggsave(
-#   filename = here::here(
-#     "output",
-#     "Figure_2.pdf"
-#   ),
-#   plot = fig_extraction_method,
-#   width = 8,
-#   height = 6,
-#   dpi = 1000
-# )
 
 combined_fig_1abc <- (p_full + p_leaf) / fig_extraction_method +
   plot_layout(heights = c(1, 1.3)) +  # give more vertical room to panel c if needed
@@ -1951,32 +1859,20 @@ ggsave(
 )
 
 
-# test of how many axes I would need
-
-pa <- psych::fa.parallel(
-  data_pca,
-  fa = "pc",
-  n.iter = 1000,
-  show.legend = TRUE
-)
-pa$ncomp  # number of components to retain
-
-
-
-r2_unique <- sapply(names(data_pca), function(v) {
-  f <- as.formula(paste(v, "~ ."))
-  summary(lm(f, data = data_pca))$r.squared
-})
-r2_unique
-
-
-library(car)
-vif(lm(gs_max ~ VPD_opt + VPD50 + Sclosure, data = data_pca))
 
 ```
 ## 5.6. Fig. S7 - Overview of Metrics
 
 ```{r metrics figure}
+
+# stomatal_behaviour_species_metrics <- 
+#   stomatal_behaviour_species_metrics %>% 
+#   mutate(tree_group = case_when(
+#     species=="Tor_gla" ~ "broadleaved",
+#     species=="Pla_his" ~ "broadleaved",
+#     species=="Cor_dom" ~ "broadleaved",
+#     TRUE ~ tree_group))
+
 
 species_order <- stomatal_behaviour_species_metrics %>%
   arrange(gs_max) %>% 
@@ -2068,7 +1964,7 @@ make_panel <- function(data, title_text, x_axis_expr, y_title = NULL) {
 
 
 # Create one panel for each stomatal behaviour metric.
-p1 <- make_panel(metrics_list$gs_max,    "Maximal capacity", expression(g[max]~(mol~m^{-2}~s^{-1})), "Species")
+p1 <- make_panel(metrics_list$gs_max,    "Maximum gs", expression(g[max]~(mol~m^{-2}~s^{-1})), "Species")
 p2 <- make_panel(metrics_list$VPD_opt,   "VPD optimum",      expression(VPD[opt]~(kPa)))
 p3 <- make_panel(metrics_list$VPD_50,    "VPD at half-closure",    expression(VPD[50]~(kPa)))
 p4 <- make_panel(metrics_list$S_closure, "Closure rate",     expression(S[closure]))
