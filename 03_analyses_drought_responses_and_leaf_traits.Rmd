@@ -691,7 +691,7 @@ metric_labels <- list(
     paste("VPD optimum (VPD", scriptscriptstyle(italic(opt)), ", kPa)")
   ),
   "VPD50" = expression(
-    paste("VPD tolerance (VPD", scriptscriptstyle(50), ", kPa)")
+    paste("VPD at half closure (VPD", scriptscriptstyle(50), ", kPa)")
   ),
   "Sclosure" = expression(
     paste("Closure rate (", italic(S)[closure], ")")
